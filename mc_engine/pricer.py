@@ -3,33 +3,51 @@
 Paths are drawn in fixed-size chunks and combined with Chan's parallel mean/variance update,
 so memory stays flat at any path count and the result is identical to a single large draw
 from the same generator.
+
+``price_european(method=...)`` is the single entry point. ``"plain"`` lives here; the
+variance-reduced estimators live in ``mc_engine.variance_reduction``.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Literal
 
 import numpy as np
+from scipy import stats
 
 from mc_engine import gbm
 from mc_engine.black_scholes import OptionKind
 
 DEFAULT_CHUNK = 1 << 20
 
+Method = Literal["plain", "antithetic", "control_variate", "sobol"]
+Seed = int | np.random.SeedSequence | None
+
 
 @dataclass(frozen=True)
 class MCResult:
     price: float
     std_error: float
-    n_paths: int
+    n_paths: int  # payoff evaluations, the cost unit every method is compared on
+    method: str = "plain"
+    # Degrees of freedom behind the standard error. None means many (normal quantiles);
+    # randomized QMC estimates its error from a handful of replicates, so it uses Student's t.
+    dof: int | None = None
+
+    def quantile(self, level: float) -> float:
+        """Two-sided critical value for a ``level`` confidence interval."""
+        p = 0.5 + level / 2
+        return float(stats.norm.ppf(p) if self.dof is None else stats.t.ppf(p, self.dof))
 
     @property
     def ci95(self) -> tuple[float, float]:
-        half = 1.959963984540054 * self.std_error
+        half = self.quantile(0.95) * self.std_error
         return self.price - half, self.price + half
 
     def z_score(self, reference: float) -> float:
-        """(estimate - reference) / standard error. Roughly N(0, 1) for an unbiased estimator."""
+        """(estimate - reference) / standard error. Roughly N(0, 1) for an unbiased estimator
+        (Student's t with ``dof`` degrees of freedom when ``dof`` is set)."""
         return (self.price - reference) / self.std_error
 
 
@@ -70,14 +88,31 @@ def price_european(
     q: float = 0.0,
     kind: OptionKind = "call",
     n_paths: int = 1_000_000,
-    seed: int | np.random.SeedSequence | None = 0,
+    seed: Seed = 0,
     chunk: int = DEFAULT_CHUNK,
+    *,
+    method: Method = "plain",
+    **options,
 ) -> MCResult:
-    """Plain Monte Carlo price of a European call or put under GBM.
+    """Monte Carlo price of a European call or put under GBM.
 
-    The estimator is the discounted mean payoff; its standard error is the sample standard
-    deviation over sqrt(n_paths), so it shrinks as 1/sqrt(N).
+    ``method`` picks the estimator; ``options`` go to it (see ``mc_engine.variance_reduction``).
+    Plain Monte Carlo is the discounted mean payoff with standard error equal to the sample
+    standard deviation over sqrt(n_paths), so it shrinks as 1/sqrt(N).
     """
+    if method != "plain":
+        from mc_engine import variance_reduction as vr
+
+        estimators = {
+            "antithetic": vr.antithetic,
+            "control_variate": vr.control_variate,
+            "sobol": vr.sobol_rqmc,
+        }
+        if method not in estimators:
+            raise ValueError(f"unknown method {method!r}")
+        return estimators[method](s0, k, t, r, sigma, q, kind, n_paths, seed, chunk, **options)
+    if options:
+        raise TypeError(f"plain Monte Carlo takes no options, got {sorted(options)}")
     if n_paths < 2:
         raise ValueError("n_paths must be at least 2 to estimate a standard error")
     rng = np.random.default_rng(seed)

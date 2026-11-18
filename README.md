@@ -7,11 +7,62 @@
 
 **One market-making research system rather than three separate demos.** A Monte Carlo engine simulates a hidden fair value. Agents send orders around it into a C++20 limit order book. A market maker quotes into that book through a risk layer, and analytics score the result.
 
-> **Status:** Phase 1 (foundation) is done. Project 1 step 1 is done, and its gate passes: Monte Carlo prices agree with Black–Scholes, with correctly sized error bars over 1,200 independent runs.
+> **Status:** Foundation done. Project 1 is at step 2 of 7. On an at-the-money call at equal path count, the variance-reduced pricers cut variance by **2.5× (antithetic), 5.3× (control variate) and about 2,200× (randomized Sobol)**. Every method's error bars pass a calibration gate in CI.
 
 ## Results so far
 
-### Monte Carlo vs Black–Scholes (Phase 1 gate)
+### Variance reduction (Project 1, step 2)
+
+Variance-reduction factor (VRF) = Var(plain estimates) / Var(method estimates) at the same number of paths. Each factor comes from 200 independent runs per method, not from the method's own reported error.
+
+| Method (16,384 paths) | call K=80 (ITM) | call K=100 (ATM) | call K=130 (OTM) | put K=100 (ATM) |
+|---|---:|---:|---:|---:|
+| Antithetic | 10.5× | 2.5× | 1.2× | 1.7× |
+| Control variate (S_T) | 64.8× | 5.3× | 1.7× | 2.7× |
+| Sobol RQMC (16 scramblings) | 2,853× | 2,190× | 401× | 12,762× |
+
+S = 100, σ = 20%, T = 1y, r = 5%. Each factor's 95% CI runs from about ×0.76 to ×1.32 of the value shown.
+
+Antithetic and the S_T control both work only when the payoff moves almost linearly with S_T. That's why they're strong deep in the money and fade out of the money, where most paths pay zero. Sobol doesn't depend on payoff shape. Its error falls at about 1/N against 1/√N for the others, so its lead grows with N.
+
+![Variance reduction convergence](docs/figures/variance_reduction.png)
+
+**At equal wall-clock** (ATM call, 262,144 paths, single core, best of 5):
+
+| Method | Time | VRF | Efficiency gain |
+|---|---:|---:|---:|
+| Plain MC | 5.1 ms | 1.0× | 1.0× |
+| Antithetic | 3.4 ms | 2.5× | 3.7× |
+| Control variate (S_T) | 5.9 ms | 5.3× | 4.6× |
+| Sobol RQMC | 9.3 ms | 2,190× | 1,209× |
+
+Antithetic gains more than its VRF because it draws half as many normals.
+
+**Why the Brownian bridge matters.** Path-dependent payoffs need multi-step paths, and each step uses another Sobol dimension. Sobol's later dimensions are much less uniform than its first few. Built step by step, a 64-step path spreads S_T across all 64 dimensions and loses nearly all the QMC gain. The bridge sets W_T from the first dimension and fills in midpoints after, which restores it:
+
+| ATM call from 64-step Sobol paths (50 runs each) | VRF vs plain |
+|---|---:|
+| 1 step, terminal draw only (reference) | 1,657× |
+| 64 steps, standard construction | 20× |
+| 64 steps, Brownian bridge | 1,122× |
+
+**Honest error bars.** Each estimator computes its standard error in its own way:
+- Antithetic uses pair averages, because the two halves of a pair are correlated.
+- The control variate takes beta from an independent pilot run, since fitting it in-sample adds O(1/N) bias.
+- Sobol uses the spread across 16 independent scramblings, with Student's t quantiles.
+
+CI checks all four against their observed spread over 800 runs each:
+
+| Method | mean SE² / observed variance | inside \|z\| < 1 | inside \|z\| < 2 |
+|---|---:|---:|---:|
+| Plain MC | 0.94 | 68.9% | 94.9% |
+| Antithetic | 1.07 | 69.5% | 95.0% |
+| Control variate (S_T) | 0.92 | 67.5% | 93.0% |
+| Sobol RQMC | 1.06 | 67.5% | 93.9% |
+
+Expected values are 1, 68.3% ± 6.6% and 95.5% ± 2.9%, with bands at 4σ. That width is deliberate. The gate makes 12 checks, and at 3σ a correct estimator would fail one of them about 3% of the time. That happened once in development to the control variate, and 8,000 fresh runs confirmed it was calibrated. [`test_calibration_gate.py`](tests/test_calibration_gate.py) shows the 4σ gate never fails honest error bars and rejects any that are 20% too small or too large.
+
+### Monte Carlo vs Black–Scholes (step 1 gate)
 
 "Within one standard error" is a coverage claim, so the gate tests coverage. If the estimator is unbiased and its standard error is honest, then z = (MC − BS) / SE is standard normal. That means about 68% of runs should land inside |z| < 1, and 95% inside |z| < 2.
 
@@ -58,7 +109,7 @@ flowchart TB
 | Phase | Scope | Gate | Status |
 |---|---|---|---|
 | 0 · Foundation | Monorepo, CMake + uv, CI with ASan/UBSan, LOBSTER loader | CI green | ✅ done |
-| 1 · Monte Carlo engine | Pricer with error bars → variance reduction → Greeks → Asian/barrier/American (Longstaff–Schwartz) → Heston → SPY calibration → Numba | MC within its standard error of Black–Scholes | 🟡 step 1 of 7 |
+| 1 · Monte Carlo engine | Pricer with error bars ✅ → variance reduction ✅ → Greeks → Asian/barrier/American (Longstaff–Schwartz) → Heston → SPY calibration → Numba | MC within its standard error of Black–Scholes | 🟡 step 2 of 7 |
 | 2 · Limit order book | C++20 matching engine, property tests, LOBSTER replay, benchmarks, pybind11 | Rebuilt book matches LOBSTER on every event | ⏳ |
 | 3 · Market maker | Avellaneda–Stoikov, order-flow-imbalance skew, markouts, risk overlay | Walk-forward, out-of-sample, net of fees | ⏳ |
 | 4 · Add-ons | Delta-hedging PnL simulator, Almgren–Chriss execution on the book | — | ⏳ |
@@ -72,8 +123,9 @@ git clone https://github.com/naqi-zaidi/quant-stack.git
 cd quant-stack
 uv sync
 uv run pytest                                        # unit + property tests
-uv run python -m mc_engine.experiments.bs_gate       # Phase 1 gate tables
-uv run python -m mc_engine.experiments.convergence   # regenerates the figure above
+uv run python -m mc_engine.experiments.bs_gate             # step 1 gate tables
+uv run python -m mc_engine.experiments.convergence         # 1/√N figure
+uv run python -m mc_engine.experiments.variance_reduction  # step 2 tables + figure (~20 s)
 ```
 
 C++ core (needs CMake ≥ 3.25 and a C++20 compiler):
@@ -91,13 +143,19 @@ from mc_engine import price_european, bs_price
 
 res = price_european(s0=100, k=100, t=1.0, r=0.05, sigma=0.2, n_paths=1_000_000, seed=0)
 res.price, res.std_error, res.ci95, res.z_score(bs_price(100, 100, 1.0, 0.05, 0.2))
+
+# Same call, variance-reduced: method = "antithetic" | "control_variate" | "sobol"
+price_european(
+    100, 100, 1.0, 0.05, 0.2, n_paths=1 << 16, method="sobol", n_steps=64, construction="bridge"
+)
 ```
 
 ## Layout
 
 ```
 quant-stack/
-  mc_engine/          Project 1: GBM (exact log step), Black–Scholes, Monte Carlo pricer
+  mc_engine/          Project 1: GBM (exact log step), Black–Scholes, Monte Carlo pricer,
+                      variance reduction, Brownian bridge + scrambled Sobol
     experiments/      scripts that produce every number in this README
   lob/                Project 2: C++20 core (types today; matching engine next)
   marketdata/         loaders: LOBSTER today; crypto L2 and option chains with later phases
@@ -116,7 +174,8 @@ quant-stack/
 
 ## Current limitations
 
-- Plain Monte Carlo only. Antithetic, control-variate and Sobol estimators are the next step, and each will report its variance-reduction factor against this baseline.
+- European payoffs only so far, so the S_T control variate is the simplest one available. Step 4 (Asian options) brings the stronger geometric-Asian control, which has a closed form.
+- Timings come from one machine, single-threaded NumPy. The variance-reduction factors are machine-independent, and the efficiency column is not.
 - GBM dynamics only. Jumps (Merton) and stochastic volatility (Heston) arrive in steps 5 and 6.
 - The C++ side holds only shared types and the build/test/sanitizer pipeline. The matching engine is Phase 2.
 

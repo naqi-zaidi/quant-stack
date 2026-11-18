@@ -24,8 +24,10 @@ jobs:
         run: uv run ruff check .
       - name: Tests
         run: uv run pytest
-      - name: Phase 1 gate (Monte Carlo vs Black–Scholes)
+      - name: Step 1 gate (Monte Carlo vs Black–Scholes)
         run: uv run python -m mc_engine.experiments.bs_gate
+      - name: Step 2 gate (variance-reduced error bars are calibrated)
+        run: uv run python -m mc_engine.experiments.variance_reduction --no-figure
 
   cpp:
     name: C++ (${{ matrix.preset }})
