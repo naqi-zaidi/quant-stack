@@ -7,9 +7,49 @@
 
 **One market-making research system rather than three separate demos.** A Monte Carlo engine simulates a hidden fair value. Agents send orders around it into a C++20 limit order book. A market maker quotes into that book through a risk layer, and analytics score the result.
 
-> **Status:** Foundation done. Project 1 is at step 2 of 7. On an at-the-money call at equal path count, the variance-reduced pricers cut variance by **2.5× (antithetic), 5.3× (control variate) and about 2,200× (randomized Sobol)**. Every method's error bars pass a calibration gate in CI.
+> **Status:** Foundation done. Project 1 is at step 3 of 7.
+> - **Step 3 (Greeks):** delta and vega from three estimators all land within 4 standard errors of Black–Scholes. The pathwise estimator's known failure on digital options is shown, not hidden.
+> - **Step 2 (variance reduction):** on an at-the-money call at equal path count, variance falls **2.5× (antithetic), 5.3× (control variate) and about 2,200× (randomized Sobol)**.
+>
+> CI runs a gate for every step.
 
 ## Results so far
+
+### Greeks (Project 1, step 3)
+
+Delta and vega are computed from the same paths by three estimators, each with its own standard error:
+
+| Estimator | How it works | Breaks when |
+|---|---|---|
+| **Pathwise** | differentiates the payoff along each path | payoff is discontinuous (digitals, barriers) |
+| **Likelihood ratio** | differentiates the probability density instead | maturity is short and the option is away from the money (variance explodes) |
+| **Bump + CRN** | reprices at ±h reusing the same random numbers | h is too large (O(h²) bias) |
+
+Results at 262,144 paths (σ = 25%, T = 1y). Each cell is the estimate with its z-score against the closed form:
+
+| Contract | Greek | Black–Scholes | Pathwise | Likelihood ratio | Bump + CRN |
+|---|---|---:|---:|---:|---:|
+| call K=80 | delta | 0.8718 | 0.8711 (−0.8) | 0.8755 (+1.0) | 0.8709 (−1.0) |
+| call K=100 | delta | 0.6061 | 0.6055 (−0.5) | 0.6022 (−1.4) | 0.6052 (−0.7) |
+| call K=100 | vega | 37.9253 | 37.7010 (−1.5) | 37.2273 (−1.3) | 37.7024 (−1.5) |
+| put K=100 | delta | −0.3840 | −0.3841 (−0.2) | −0.3859 (−1.2) | −0.3840 (−0.1) |
+| digital call K=100 | delta | 0.0152 | **0.0000 ✗** | 0.0152 (+0.5) | 0.0151 (−0.6) |
+| digital call K=100 | vega | −0.4323 | **0.0000 ✗** | −0.4364 (−0.6) | −0.4278 (+0.5) |
+
+The full 10-row table comes from `mc_engine.experiments.greeks`, and all 28 valid cells pass the 4σ gate in CI.
+
+On the digital, pathwise returns exactly 0 with a standard error of 0. The payoff's derivative is zero almost everywhere, so the estimator is confidently wrong. The likelihood ratio handles it because it never differentiates the payoff.
+
+**When the likelihood ratio becomes unusable.** Its weights grow like 1/(σ√T), so it can't be used at short maturities away from the money. At the money the call payoff also shrinks like √T, which cancels the growth, and the delta variance ratio converges to exactly 5:
+
+| LR variance ÷ pathwise variance | T=2 | T=1 | T=0.25 | T=0.05 | T=0.01 |
+|---|---:|---:|---:|---:|---:|
+| ITM call (K=80), delta | 11.7× | 17.6× | 110× | 4,863× | 106,702× |
+| ATM call (K=100), delta | 6.0× | 5.9× | 5.4× | 5.2× | 5.0× |
+
+![Bump size study](docs/figures/greeks_bump_size.png)
+
+**Bumping needs common random numbers.** With independent draws up and down, the finite-difference variance grows like 1/h². At a $0.001 bump the delta error is about 59, against a true value of 0.6. Reusing the same draws keeps the error flat at the pathwise level, from h = $0.001 up to about $4, until O(h²) bias takes over.
 
 ### Variance reduction (Project 1, step 2)
 
@@ -109,7 +149,7 @@ flowchart TB
 | Phase | Scope | Gate | Status |
 |---|---|---|---|
 | 0 · Foundation | Monorepo, CMake + uv, CI with ASan/UBSan, LOBSTER loader | CI green | ✅ done |
-| 1 · Monte Carlo engine | Pricer with error bars ✅ → variance reduction ✅ → Greeks → Asian/barrier/American (Longstaff–Schwartz) → Heston → SPY calibration → Numba | MC within its standard error of Black–Scholes | 🟡 step 2 of 7 |
+| 1 · Monte Carlo engine | Pricer with error bars ✅ → variance reduction ✅ → Greeks ✅ → Asian/barrier/American (Longstaff–Schwartz) → Heston → SPY calibration → Numba | MC within its standard error of Black–Scholes | 🟡 step 3 of 7 |
 | 2 · Limit order book | C++20 matching engine, property tests, LOBSTER replay, benchmarks, pybind11 | Rebuilt book matches LOBSTER on every event | ⏳ |
 | 3 · Market maker | Avellaneda–Stoikov, order-flow-imbalance skew, markouts, risk overlay | Walk-forward, out-of-sample, net of fees | ⏳ |
 | 4 · Add-ons | Delta-hedging PnL simulator, Almgren–Chriss execution on the book | — | ⏳ |
@@ -126,6 +166,7 @@ uv run pytest                                        # unit + property tests
 uv run python -m mc_engine.experiments.bs_gate             # step 1 gate tables
 uv run python -m mc_engine.experiments.convergence         # 1/√N figure
 uv run python -m mc_engine.experiments.variance_reduction  # step 2 tables + figure (~20 s)
+uv run python -m mc_engine.experiments.greeks              # step 3 tables + figure
 ```
 
 C++ core (needs CMake ≥ 3.25 and a C++20 compiler):
@@ -148,6 +189,12 @@ res.price, res.std_error, res.ci95, res.z_score(bs_price(100, 100, 1.0, 0.05, 0.
 price_european(
     100, 100, 1.0, 0.05, 0.2, n_paths=1 << 16, method="sobol", n_steps=64, construction="bridge"
 )
+
+# Delta and vega by pathwise, likelihood ratio and bump + CRN, from one set of paths
+from mc_engine.greeks import mc_greeks
+
+g = mc_greeks(100, 100, 1.0, 0.05, 0.2, kind="call")
+g.delta["pathwise"], g.vega["likelihood_ratio"]
 ```
 
 ## Layout
@@ -155,7 +202,7 @@ price_european(
 ```
 quant-stack/
   mc_engine/          Project 1: GBM (exact log step), Black–Scholes, Monte Carlo pricer,
-                      variance reduction, Brownian bridge + scrambled Sobol
+                      variance reduction, Brownian bridge + scrambled Sobol, Greeks
     experiments/      scripts that produce every number in this README
   lob/                Project 2: C++20 core (types today; matching engine next)
   marketdata/         loaders: LOBSTER today; crypto L2 and option chains with later phases

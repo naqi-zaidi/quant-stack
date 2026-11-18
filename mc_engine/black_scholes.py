@@ -53,3 +53,28 @@ def bs_vega(s, k, t, r, sigma, q=0.0) -> np.ndarray:
     d1, _ = _d1_d2(s, k, t, r, sigma, q)
     pdf = np.exp(-0.5 * d1**2) / np.sqrt(2.0 * np.pi)
     return np.asarray(s) * np.exp(-np.asarray(q) * np.asarray(t)) * pdf * np.sqrt(t)
+
+
+# Cash-or-nothing digital call: pays 1 if S_T > K. Its payoff jumps at K, which is exactly
+# the case where pathwise Greeks fail and likelihood-ratio Greeks still work.
+
+
+def bs_digital_call(s, k, t, r, sigma, q=0.0) -> np.ndarray:
+    """Price e^{-rT} N(d2)."""
+    _, d2 = _d1_d2(s, k, t, r, sigma, q)
+    return np.exp(-np.asarray(r) * np.asarray(t)) * ndtr(d2)
+
+
+def bs_digital_call_delta(s, k, t, r, sigma, q=0.0) -> np.ndarray:
+    """e^{-rT} n(d2) / (S sigma sqrt(T))."""
+    _, d2 = _d1_d2(s, k, t, r, sigma, q)
+    pdf = np.exp(-0.5 * d2**2) / np.sqrt(2.0 * np.pi)
+    disc = np.exp(-np.asarray(r) * np.asarray(t))
+    return disc * pdf / (np.asarray(s) * np.asarray(sigma) * np.sqrt(t))
+
+
+def bs_digital_call_vega(s, k, t, r, sigma, q=0.0) -> np.ndarray:
+    """-e^{-rT} n(d2) d1 / sigma, using d(d2)/d(sigma) = -d1 / sigma."""
+    d1, d2 = _d1_d2(s, k, t, r, sigma, q)
+    pdf = np.exp(-0.5 * d2**2) / np.sqrt(2.0 * np.pi)
+    return -np.exp(-np.asarray(r) * np.asarray(t)) * pdf * d1 / np.asarray(sigma)

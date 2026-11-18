@@ -14,7 +14,7 @@ jobs:
     name: Python (lint + tests)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: astral-sh/setup-uv@v6
         with:
           enable-cache: true
@@ -28,6 +28,8 @@ jobs:
         run: uv run python -m mc_engine.experiments.bs_gate
       - name: Step 2 gate (variance-reduced error bars are calibrated)
         run: uv run python -m mc_engine.experiments.variance_reduction --no-figure
+      - name: Step 3 gate (Greeks match Black–Scholes)
+        run: uv run python -m mc_engine.experiments.greeks --no-figure
 
   cpp:
     name: C++ (${{ matrix.preset }})
@@ -37,7 +39,7 @@ jobs:
       matrix:
         preset: [asan, release]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Configure
         run: cmake --preset ${{ matrix.preset }}
       - name: Build
