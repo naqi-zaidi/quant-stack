@@ -5,7 +5,7 @@ description = "Connected market-making research stack: Monte Carlo pricing, a C+
 readme = "README.md"
 requires-python = ">=3.12"
 license = "MIT"
-authors = [{ name = "Mohamed Naqi" }]
+authors = [{ name = "Mohammad Naqi Zaidi" }]
 dependencies = [
     "numpy>=2.0",
     "scipy>=1.15",
