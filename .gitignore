@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+.ruff_cache/
+.hypothesis/
+*.egg-info/
+dist/
+
+# C++ / CMake
+build/
+out/
+CMakeUserPresets.json
+compile_commands.json
+
+# Market data stays local; only the README is tracked
+data/*
+!data/README.md
+
+# Editors and OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
