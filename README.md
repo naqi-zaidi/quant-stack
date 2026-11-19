@@ -7,7 +7,8 @@
 
 **One market-making research system rather than three separate demos.** A Monte Carlo engine simulates a hidden fair value. Agents send orders around it into a C++20 limit order book. A market maker quotes into that book through a risk layer, and analytics score the result.
 
-> **Status:** Foundation done. Project 1 is at step 6 of 7.
+> **Status:** Foundation done. **Project 1 (Monte Carlo engine) is complete.** Phase 2, the C++ limit order book, is next.
+> - **Step 7 (speed):** Numba kernels run 1.5–2.4× faster than vectorised NumPy on 2 cores, and give bit-identical results at any thread count.
 > - **Step 6 (calibration):** Heston fitted to a real SPY option snapshot (2,874 quotes, 22 expiries) prices **held-out strikes to within 0.47 implied-vol points**, against 5.6 for a single flat volatility.
 > - **Step 5 (beyond GBM):** Merton jump-diffusion and Heston stochastic volatility. The semi-analytic Heston pricer matches **published benchmark values to within 2×10⁻⁷**, and Andersen's QE scheme removes the time-step bias that Euler still shows at 32 steps a year.
 > - **Step 4 (path-dependent):** an arithmetic Asian priced with **16,000× less variance** than plain Monte Carlo; a barrier option with **no monitoring bias at any grid size**; and American puts by Longstaff–Schwartz, **within 1% of a binomial reference**.
@@ -17,6 +18,35 @@
 > CI runs a gate for every step.
 
 ## Results so far
+
+### Speed: NumPy vs Numba (Project 1, step 7)
+
+Three kernels, each priced by the package's vectorised NumPy code and by a Numba version compiled for one thread and for all threads. Timings are best of 3 after warm-up, on a 2-vCPU cloud machine (`mc_engine.experiments.speed`):
+
+| Kernel | NumPy | Numba serial | Numba parallel (2 threads) | Parallel vs NumPy |
+|---|---:|---:|---:|---:|
+| European call (1 draw per path) | 42M paths/s | 33M | 64M | 1.5× |
+| Arithmetic Asian, 252 steps | 133k paths/s | 145k | 293k | 2.2× |
+| Heston QE, 252 steps (2 draws + a branch per step) | 66k paths/s | 79k | 160k | 2.4× |
+
+Every benchmarked price is checked before its timing counts: within 4 standard errors of the closed form or reference, and serial vs parallel bit-identical. On the same input normals, the Numba kernels reproduce the NumPy code exactly (`tests/test_fast.py`). Compiling all six kernels takes about 3.6 s once per process.
+
+**Where the time goes.** Single-threaded Numba barely beats NumPy, and loses on the European, because of random number generation, not the model:
+
+| Share of runtime spent drawing normals | NumPy (PCG64 + ziggurat) | Numba (xoshiro256** + Box–Muller) |
+|---|---:|---:|
+| European call | 66% | 70% |
+| Arithmetic Asian | 46% | 74% |
+| Heston QE | 46% | 84% |
+
+With the generator taken out, Numba runs the model arithmetic about 2.3× faster than NumPy for the Asian and 4× faster for Heston. There are no 252-column intermediate arrays and no masked branches. Box–Muller, at a log, a sqrt and a sin/cos pair for every two normals, gives most of that back against NumPy's ziggurat. A ziggurat or fast inverse-CDF normal generator is the obvious next speed-up.
+
+**Three bugs found on the way to parallel speed:**
+1. **Built-in generator in parallel loops:** Numba's `np.random` has to look up the current thread's generator state on every draw, which made the parallel build 2.3× slower per thread. Fix: an explicit xoshiro256** generator whose state lives in local variables, seeded per block of 4,096 paths.
+2. **Code inside the parallel loop:** writing the whole loop body inside `prange` was optimised worse than the same code in its own function. Fix: a trivial `prange` loop over blocks that calls a normally compiled per-block function.
+3. **Shared cache entry:** compiling the serial and parallel builds from one function with `cache=True` gave them the same on-disk cache entry, so the "parallel" kernel silently loaded the serial machine code. Fix: the two-variant drivers aren't cached.
+
+Because each block of paths always runs start to finish on one thread with its own seed, results don't depend on the thread count.
 
 ### Heston calibrated to SPY (Project 1, step 6)
 
@@ -253,7 +283,7 @@ flowchart TB
 | Phase | Scope | Gate | Status |
 |---|---|---|---|
 | 0 · Foundation | Monorepo, CMake + uv, CI with ASan/UBSan, LOBSTER loader | CI green | ✅ done |
-| 1 · Monte Carlo engine | Pricer with error bars ✅ → variance reduction ✅ → Greeks ✅ → Asian/barrier/American (Longstaff–Schwartz) ✅ → Merton + Heston ✅ → SPY calibration ✅ → Numba | MC within its standard error of Black–Scholes | 🟡 step 6 of 7 |
+| 1 · Monte Carlo engine | Pricer with error bars ✅ → variance reduction ✅ → Greeks ✅ → Asian/barrier/American (Longstaff–Schwartz) ✅ → Merton + Heston ✅ → SPY calibration ✅ → Numba ✅ | MC within its standard error of Black–Scholes | ✅ done |
 | 2 · Limit order book | C++20 matching engine, property tests, LOBSTER replay, benchmarks, pybind11 | Rebuilt book matches LOBSTER on every event | ⏳ |
 | 3 · Market maker | Avellaneda–Stoikov, order-flow-imbalance skew, markouts, risk overlay | Walk-forward, out-of-sample, net of fees | ⏳ |
 | 4 · Add-ons | Delta-hedging PnL simulator, Almgren–Chriss execution on the book | — | ⏳ |
@@ -274,6 +304,7 @@ uv run python -m mc_engine.experiments.greeks              # step 3 tables + fig
 uv run python -m mc_engine.experiments.path_dependent      # step 4 tables + figure (~20 s)
 uv run python -m mc_engine.experiments.models              # step 5 tables + figure (~25 s)
 uv run python -m mc_engine.experiments.calibration         # step 6: Heston fit to SPY (~20 s)
+uv run python -m mc_engine.experiments.speed               # step 7: NumPy vs Numba throughput (~30 s)
 ```
 
 C++ core (needs CMake ≥ 3.25 and a C++20 compiler):
@@ -328,6 +359,11 @@ surface = build_surface(
     load_yfinance_snapshot("data/snapshots/spy_options_2026-11-19.csv.gz"), rate=0.039
 )
 calibrate(surface).params
+
+# Same prices, compiled: serial or multi-threaded, identical results either way
+from mc_engine.fast import price_heston_numba
+
+price_heston_numba(100, 100, 1.0, 0.05, p, n_steps=252, n_paths=1 << 18, parallel=True)
 ```
 
 ## Layout
@@ -338,7 +374,7 @@ quant-stack/
                       variance reduction, Brownian bridge + scrambled Sobol, Greeks,
                       Asian / barrier / American (Longstaff–Schwartz + binomial reference),
                       Merton jump-diffusion, Heston (semi-analytic, Euler, QE), implied vol,
-                      fast Heston surface pricer + calibration
+                      fast Heston surface pricer + calibration, Numba kernels (fast.py)
     experiments/      scripts that produce every number in this README
   lob/                Project 2: C++20 core (types today; matching engine next)
   marketdata/         loaders: LOBSTER, option-chain snapshots → implied-vol surface
@@ -359,7 +395,7 @@ quant-stack/
 
 - Barriers: only the down-and-out call with barrier ≤ strike has a closed form here. The bridge correction works for any single barrier, but the other cases have no reference yet.
 - Longstaff–Schwartz gives a lower bound only, with a fixed cubic basis. An Andersen–Broadie duality upper bound would bracket the true price from both sides.
-- Timings come from one machine, single-threaded NumPy. The variance-reduction factors are machine-independent, and the efficiency column is not.
+- Timings come from one machine: a 2-vCPU cloud container here. The variance-reduction factors and correctness results are machine-independent, and the throughput figures aren't. Parallel scaling was only measured up to 2 threads; rerun `mc_engine.experiments.speed` on more cores.
 - The QE scheme runs without Andersen's martingale correction, so a small residual drift remains. It's within noise at 8+ steps a year in the test above.
 - SPY options are American; the calibration treats them as European. Using out-of-the-money quotes only keeps the early-exercise premium small, but doesn't remove it.
 - One snapshot, flat discounting at 3.9%. Forwards come from parity, so the dividend yield is never needed. A term structure of rates would barely move the vols.

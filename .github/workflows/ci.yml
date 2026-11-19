@@ -36,6 +36,8 @@ jobs:
         run: uv run python -m mc_engine.experiments.models --no-figure
       - name: Step 6 gate (Heston calibration to SPY, parameter recovery)
         run: uv run python -m mc_engine.experiments.calibration --no-figure
+      - name: Step 7 gate (Numba kernels correct; throughput printed for this runner)
+        run: uv run python -m mc_engine.experiments.speed
 
   cpp:
     name: C++ (${{ matrix.preset }})
