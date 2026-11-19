@@ -34,6 +34,8 @@ jobs:
         run: uv run python -m mc_engine.experiments.path_dependent --no-figure
       - name: Step 5 gate (Merton, Heston benchmarks and smile)
         run: uv run python -m mc_engine.experiments.models --no-figure
+      - name: Step 6 gate (Heston calibration to SPY, parameter recovery)
+        run: uv run python -m mc_engine.experiments.calibration --no-figure
 
   cpp:
     name: C++ (${{ matrix.preset }})

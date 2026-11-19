@@ -7,7 +7,8 @@
 
 **One market-making research system rather than three separate demos.** A Monte Carlo engine simulates a hidden fair value. Agents send orders around it into a C++20 limit order book. A market maker quotes into that book through a risk layer, and analytics score the result.
 
-> **Status:** Foundation done. Project 1 is at step 5 of 7.
+> **Status:** Foundation done. Project 1 is at step 6 of 7.
+> - **Step 6 (calibration):** Heston fitted to a real SPY option snapshot (2,874 quotes, 22 expiries) prices **held-out strikes to within 0.47 implied-vol points**, against 5.6 for a single flat volatility.
 > - **Step 5 (beyond GBM):** Merton jump-diffusion and Heston stochastic volatility. The semi-analytic Heston pricer matches **published benchmark values to within 2×10⁻⁷**, and Andersen's QE scheme removes the time-step bias that Euler still shows at 32 steps a year.
 > - **Step 4 (path-dependent):** an arithmetic Asian priced with **16,000× less variance** than plain Monte Carlo; a barrier option with **no monitoring bias at any grid size**; and American puts by Longstaff–Schwartz, **within 1% of a binomial reference**.
 > - **Step 3 (Greeks):** delta and vega from three estimators all land within 4 standard errors of Black–Scholes. The pathwise estimator's known failure on digital options is shown, not hidden.
@@ -16,6 +17,35 @@
 > CI runs a gate for every step.
 
 ## Results so far
+
+### Heston calibrated to SPY (Project 1, step 6)
+
+**Data.** A real SPY option-chain snapshot taken 2026-11-19 at 10:03 New York time. It's committed in [`data/snapshots/`](data/snapshots) so the fit reproduces exactly. The surface is built in three steps:
+1. **Forwards** per expiry come from put-call parity at the money. They agree across strikes to a median of $0.90.
+2. **Quotes** are kept only if they're out-of-the-money, between 14 days and 2.2 years to expiry, with a positive bid and a spread of at most 50% of mid. That leaves 2,874 quotes across 22 expiries.
+3. **Implied vols** come from Black-76 on the forward, discounted at a flat 3.9% (30-day average SOFR).
+
+Every 4th strike of each expiry is held out, so the fit sees 2,164 quotes.
+
+| Model | In-sample RMSE | Held-out RMSE |
+|---|---:|---:|
+| One flat vol (Black–Scholes) | 5.87 | 5.64 |
+| Flat vol per expiry (term structure, no smile) | 5.73 | 5.49 |
+| **Heston, 5 parameters** | **0.51** | **0.47** |
+
+Errors are in implied-vol points (1.00 = 1% vol). Both baselines are fitted on the same in-sample quotes.
+
+![SPY Heston smiles](docs/figures/spy_heston_smiles.png)
+
+**Fitted parameters.** κ = 3.72, long-run vol √θ = 23.5%, spot vol √v0 = 20.8%, ρ = −0.73 and vol-of-vol ξ = 1.35. That violates the Feller condition (2κθ = 0.41 vs ξ² = 1.82), which is typical for equity-index fits. Four different starting points all converge to the same parameters to four decimal places, so the fit is identified rather than one of many local optima. The CI gate makes this a checked property: quotes regenerated from the fitted parameters on SPY's own strike grid, using the independent adaptive-quadrature pricer, must calibrate back to them.
+
+**Where Heston misses.** Errors are smallest from 3 months to 1.2 years, at 0.29–0.45 vol points held out. They grow at both ends:
+- At 2 weeks (0.55–0.76), the market's deep-put wing is steeper than any diffusion can produce over so short a horizon. That's the standard argument for adding jumps (Bates = Heston + Merton).
+- At 2 years (0.65–0.77), one mean-reverting variance factor can't match both the short- and long-dated skew.
+
+**How it's fast enough to calibrate.** The step-5 pricer uses adaptive quadrature, one strike at a time. The calibrator instead evaluates the characteristic function once per expiry on a Gauss–Legendre grid and reuses it for every strike: about 2 ms per 200-strike expiry, and about 9 s for a full 4-start calibration.
+
+The grid adapts to the parameters. When Feller is badly violated, the characteristic function decays only exponentially, and a fixed cutoff was off by up to $0.19 per option. So the cutoff doubles until |φ| < 1e-12, and the node count follows a measured rule. The result agrees with the adaptive pricer to within 1.2×10⁻¹⁰ of the forward.
 
 ### Beyond GBM: jumps and stochastic volatility (Project 1, step 5)
 
@@ -223,7 +253,7 @@ flowchart TB
 | Phase | Scope | Gate | Status |
 |---|---|---|---|
 | 0 · Foundation | Monorepo, CMake + uv, CI with ASan/UBSan, LOBSTER loader | CI green | ✅ done |
-| 1 · Monte Carlo engine | Pricer with error bars ✅ → variance reduction ✅ → Greeks ✅ → Asian/barrier/American (Longstaff–Schwartz) ✅ → Merton + Heston ✅ → SPY calibration → Numba | MC within its standard error of Black–Scholes | 🟡 step 5 of 7 |
+| 1 · Monte Carlo engine | Pricer with error bars ✅ → variance reduction ✅ → Greeks ✅ → Asian/barrier/American (Longstaff–Schwartz) ✅ → Merton + Heston ✅ → SPY calibration ✅ → Numba | MC within its standard error of Black–Scholes | 🟡 step 6 of 7 |
 | 2 · Limit order book | C++20 matching engine, property tests, LOBSTER replay, benchmarks, pybind11 | Rebuilt book matches LOBSTER on every event | ⏳ |
 | 3 · Market maker | Avellaneda–Stoikov, order-flow-imbalance skew, markouts, risk overlay | Walk-forward, out-of-sample, net of fees | ⏳ |
 | 4 · Add-ons | Delta-hedging PnL simulator, Almgren–Chriss execution on the book | — | ⏳ |
@@ -243,6 +273,7 @@ uv run python -m mc_engine.experiments.variance_reduction  # step 2 tables + fig
 uv run python -m mc_engine.experiments.greeks              # step 3 tables + figure
 uv run python -m mc_engine.experiments.path_dependent      # step 4 tables + figure (~20 s)
 uv run python -m mc_engine.experiments.models              # step 5 tables + figure (~25 s)
+uv run python -m mc_engine.experiments.calibration         # step 6: Heston fit to SPY (~20 s)
 ```
 
 C++ core (needs CMake ≥ 3.25 and a C++20 compiler):
@@ -288,6 +319,15 @@ from mc_engine.implied_vol import implied_vol
 p = HestonParams(kappa=2.0, theta=0.04, xi=0.5, rho=-0.7, v0=0.04)
 price = heston_price(100, 90, 1.0, 0.05, p)  # semi-analytic
 implied_vol(price, 100, 90, 1.0, 0.05), price_heston_mc(100, 90, 1.0, 0.05, p, scheme="qe")
+
+# Calibrate Heston to the committed SPY snapshot
+from marketdata.option_chain import build_surface, load_yfinance_snapshot
+from mc_engine.heston_calibration import calibrate
+
+surface = build_surface(
+    load_yfinance_snapshot("data/snapshots/spy_options_2026-11-19.csv.gz"), rate=0.039
+)
+calibrate(surface).params
 ```
 
 ## Layout
@@ -297,12 +337,13 @@ quant-stack/
   mc_engine/          Project 1: GBM (exact log step), Black–Scholes, Monte Carlo pricer,
                       variance reduction, Brownian bridge + scrambled Sobol, Greeks,
                       Asian / barrier / American (Longstaff–Schwartz + binomial reference),
-                      Merton jump-diffusion, Heston (semi-analytic, Euler, QE), implied vol
+                      Merton jump-diffusion, Heston (semi-analytic, Euler, QE), implied vol,
+                      fast Heston surface pricer + calibration
     experiments/      scripts that produce every number in this README
   lob/                Project 2: C++20 core (types today; matching engine next)
-  marketdata/         loaders: LOBSTER today; crypto L2 and option chains with later phases
+  marketdata/         loaders: LOBSTER, option-chain snapshots → implied-vol surface
   tests/              pytest + Hypothesis property tests
-  data/               local market data, git-ignored (see data/README.md)
+  data/               market data: committed snapshots in data/snapshots/, the rest git-ignored
   docs/figures/       figures referenced above
   .github/workflows/  CI: lint, tests, gate, C++ under ASan/UBSan and Release
 ```
@@ -320,7 +361,9 @@ quant-stack/
 - Longstaff–Schwartz gives a lower bound only, with a fixed cubic basis. An Andersen–Broadie duality upper bound would bracket the true price from both sides.
 - Timings come from one machine, single-threaded NumPy. The variance-reduction factors are machine-independent, and the efficiency column is not.
 - The QE scheme runs without Andersen's martingale correction, so a small residual drift remains. It's within noise at 8+ steps a year in the test above.
-- Heston prices use adaptive quadrature, one strike at a time: accurate to about 1e-9 but too slow to calibrate on. Step 6 replaces it with a vectorised quadrature for fitting to SPY.
+- SPY options are American; the calibration treats them as European. Using out-of-the-money quotes only keeps the early-exercise premium small, but doesn't remove it.
+- One snapshot, flat discounting at 3.9%. Forwards come from parity, so the dividend yield is never needed. A term structure of rates would barely move the vols.
+- Heston can't produce the steep 2-week skew. Adding jumps (Bates) is the natural next model.
 - The C++ side holds only shared types and the build/test/sanitizer pipeline. The matching engine is Phase 2.
 
 ## License
