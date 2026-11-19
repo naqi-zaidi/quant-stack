@@ -7,7 +7,10 @@
 
 **One market-making research system rather than three separate demos.** A Monte Carlo engine simulates a hidden fair value. Agents send orders around it into a C++20 limit order book. A market maker quotes into that book through a risk layer, and analytics score the result.
 
-> **Status:** Foundation done. **Project 1 (Monte Carlo engine) is complete.** Phase 2, the C++ limit order book, is next.
+> **Status:** Foundation done. **Project 1 (Monte Carlo engine) is complete.** **Phase 2, the C++20 limit order book, is under way.**
+> - **Project 2, step 1 (matching engine):** price-time priority with O(1) cancel, all five order types plus cancel and modify, and an event stream. 66 GoogleTest cases pass under ASan/UBSan. In a 20,000-call random stress test, an L2 book rebuilt only from the engine's events matches the engine's book after every call.
+>
+> Project 1:
 > - **Step 7 (speed):** Numba kernels run 1.5–2.4× faster than vectorised NumPy on 2 cores, and give bit-identical results at any thread count.
 > - **Step 6 (calibration):** Heston fitted to a real SPY option snapshot (2,874 quotes, 22 expiries) prices **held-out strikes to within 0.47 implied-vol points**, against 5.6 for a single flat volatility.
 > - **Step 5 (beyond GBM):** Merton jump-diffusion and Heston stochastic volatility. The semi-analytic Heston pricer matches **published benchmark values to within 2×10⁻⁷**, and Andersen's QE scheme removes the time-step bias that Euler still shows at 32 steps a year.
@@ -18,6 +21,51 @@
 > CI runs a gate for every step.
 
 ## Results so far
+
+### Limit order book: the matching engine (Project 2, step 1)
+
+A single-threaded C++20 matching engine ([`lob/`](lob)). Prices are integer ticks, so every price comparison is exact.
+
+**How it's built.**
+
+| Piece | Structure | Cost |
+|---|---|---|
+| Price levels | ordered map per side, best price first | O(log L) to add a new level, O(1) to reach the best |
+| Queue at a price | intrusive doubly linked FIFO | O(1) append, match from the head, unlink anywhere |
+| Order lookup | open-addressing id → node map: linear probing, half full at most, backward-shift deletion (no tombstones) | O(1) cancel and modify |
+| Order storage | fixed-address object pool | no heap allocation once sized; nodes never move |
+
+Step 4 benchmarks the ordered map against a tick-indexed array. The profile below says an array is affordable: AAPL traded across 1,102 one-cent ticks all day.
+
+**Order types and priority rules.** Each row below is covered by its own tests.
+
+| Order | Behaviour |
+|---|---|
+| Limit | trades what crosses, rests the remainder |
+| Market | trades at any price; the remainder is cancelled, never rests |
+| IOC | trades what crosses its limit; the remainder is cancelled |
+| FOK | fills in full within its limit, or is rejected with nothing traded |
+| Post-only | rests without trading, or is rejected if it would cross (equal price included) |
+| Cancel | removes the order; an emptied level disappears |
+| Modify | a size-down at the same price keeps queue priority. A price change or a size-up is a cancel-replace: the order goes to the back of the queue, and a limit order re-priced through the spread trades first. A post-only re-priced through is rejected and left untouched. |
+
+Trades print at the resting order's price. Each call returns `filled + resting + cancelled`, which equals the quantity sent, and a test checks this for every order type. A rejection never changes the book.
+
+**Event stream.** Every call publishes three streams to a subscriber:
+- trades;
+- per-order reports: New, Fill, Cancelled, Replaced and Rejected, each with a reason;
+- L2 level updates, giving a level's new total size after each change.
+
+**Evidence.**
+- 66 GoogleTest cases, run under ASan/UBSan and in Release.
+- A built-in self-check, `validate()`, walks the whole book and verifies five things: it's uncrossed; every level's total and count match its orders; arrival sequence numbers rise from head to tail (FIFO); links are intact; and the id index and pool agree with the book.
+- A seeded random stress test sends 20,000 calls (all five order types, plus cancels and modifies) around a fixed mid. The flow produced 6,457 trades, with about 100 orders resting on average. After every call, the self-check passes and an L2 book rebuilt only from level-update events matches the engine's depth exactly.
+- The id map is checked against `std::unordered_map` over 200,000 random inserts, erases and finds. A key range of 301 forces constant collisions and deletions.
+
+**The data the replay must match (LOBSTER AAPL, 2012-06-21, 10 levels).**
+- 400,391 events: 191,015 submissions, 171,126 deletions, 3,260 partial cancels, 23,658 visible executions and 11,332 hidden executions.
+- Every price is a whole cent.
+- 8,381 deletions, executions and partial cancels refer to orders that were never submitted in the file. Those orders were resting before 09:30, or sat outside the 10-level window when they arrived. Step 3's replay has to account for them explicitly rather than skip them.
 
 ### Speed: NumPy vs Numba (Project 1, step 7)
 
@@ -284,7 +332,7 @@ flowchart TB
 |---|---|---|---|
 | 0 · Foundation | Monorepo, CMake + uv, CI with ASan/UBSan, LOBSTER loader | CI green | ✅ done |
 | 1 · Monte Carlo engine | Pricer with error bars ✅ → variance reduction ✅ → Greeks ✅ → Asian/barrier/American (Longstaff–Schwartz) ✅ → Merton + Heston ✅ → SPY calibration ✅ → Numba ✅ | MC within its standard error of Black–Scholes | ✅ done |
-| 2 · Limit order book | C++20 matching engine, property tests, LOBSTER replay, benchmarks, pybind11 | Rebuilt book matches LOBSTER on every event | ⏳ |
+| 2 · Limit order book | Matching engine ✅ → property tests → LOBSTER replay → benchmarks → pybind11 → microstructure analytics | Rebuilt book matches LOBSTER on every event | 🔨 in progress |
 | 3 · Market maker | Avellaneda–Stoikov, order-flow-imbalance skew, markouts, risk overlay | Walk-forward, out-of-sample, net of fees | ⏳ |
 | 4 · Add-ons | Delta-hedging PnL simulator, Almgren–Chriss execution on the book | — | ⏳ |
 
@@ -316,6 +364,19 @@ ctest --preset asan
 ```
 
 On Windows, use the `dev` or `release` preset with Visual Studio Build Tools. The sanitizer preset targets GCC/Clang, and CI runs it on Ubuntu.
+
+```cpp
+#include "lob/order_book.hpp"
+using namespace lob;
+
+EventLog events;                     // or your own Listener subclass
+OrderBook book(&events);
+book.submit({1, Side::Sell, OrderType::Limit, Price{5'853'300}, 100});  // $585.33
+book.submit({2, Side::Buy, OrderType::IOC, Price{5'853'500}, 40});      // takes 40 @ 585.33
+book.modify(1, Price{5'853'300}, 50);  // size down: keeps its place in the queue
+book.cancel(1);
+book.depth(Side::Sell, 10);            // best-first L2 levels
+```
 
 ```python
 from mc_engine import price_european, bs_price
@@ -376,7 +437,8 @@ quant-stack/
                       Merton jump-diffusion, Heston (semi-analytic, Euler, QE), implied vol,
                       fast Heston surface pricer + calibration, Numba kernels (fast.py)
     experiments/      scripts that produce every number in this README
-  lob/                Project 2: C++20 core (types today; matching engine next)
+  lob/                Project 2: C++20 matching engine (order_book), id map, object pool,
+                      event stream; GoogleTest suite in lob/tests/
   marketdata/         loaders: LOBSTER, option-chain snapshots → implied-vol surface
   tests/              pytest + Hypothesis property tests
   data/               market data: committed snapshots in data/snapshots/, the rest git-ignored
@@ -400,7 +462,9 @@ quant-stack/
 - SPY options are American; the calibration treats them as European. Using out-of-the-money quotes only keeps the early-exercise premium small, but doesn't remove it.
 - One snapshot, flat discounting at 3.9%. Forwards come from parity, so the dividend yield is never needed. A term structure of rates would barely move the vols.
 - Heston can't produce the steep 2-week skew. Adding jumps (Bates) is the natural next model.
-- The C++ side holds only shared types and the build/test/sanitizer pipeline. The matching engine is Phase 2.
+- Order book: opening a new price level allocates a map node, so "no allocation on the hot path" holds only for orders, not levels. Step 4's tick-indexed array removes that.
+- Order book: single-threaded, no self-trade prevention, no hidden or iceberg orders. Post-only orders are rejected rather than re-priced when they would cross.
+- Order book: if memory runs out while opening a new level, the book stays internally consistent but drops that order's unfilled remainder. Sizing the pool and id map up front keeps every other allocation off the trading path.
 
 ## License
 
