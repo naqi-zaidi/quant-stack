@@ -1,0 +1,4 @@
+# Store and check out text files with LF everywhere, so Windows checkouts don't warn
+# "LF will be replaced by CRLF" and line endings never show up as diffs.
+* text=auto eol=lf
+*.png binary

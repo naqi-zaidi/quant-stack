@@ -7,7 +7,8 @@
 
 **One market-making research system rather than three separate demos.** A Monte Carlo engine simulates a hidden fair value. Agents send orders around it into a C++20 limit order book. A market maker quotes into that book through a risk layer, and analytics score the result.
 
-> **Status:** Foundation done. Project 1 is at step 4 of 7.
+> **Status:** Foundation done. Project 1 is at step 5 of 7.
+> - **Step 5 (beyond GBM):** Merton jump-diffusion and Heston stochastic volatility. The semi-analytic Heston pricer matches **published benchmark values to within 2×10⁻⁷**, and Andersen's QE scheme removes the time-step bias that Euler still shows at 32 steps a year.
 > - **Step 4 (path-dependent):** an arithmetic Asian priced with **16,000× less variance** than plain Monte Carlo; a barrier option with **no monitoring bias at any grid size**; and American puts by Longstaff–Schwartz, **within 1% of a binomial reference**.
 > - **Step 3 (Greeks):** delta and vega from three estimators all land within 4 standard errors of Black–Scholes. The pathwise estimator's known failure on digital options is shown, not hidden.
 > - **Step 2 (variance reduction):** on an at-the-money call at equal path count, variance falls **2.5× (antithetic), 5.3× (control variate) and about 2,200× (randomized Sobol)**.
@@ -15,6 +16,38 @@
 > CI runs a gate for every step.
 
 ## Results so far
+
+### Beyond GBM: jumps and stochastic volatility (Project 1, step 5)
+
+Black–Scholes gives every strike the same implied vol. Real option markets show a skew, with downside strikes dearer, and both models below produce one for a different reason. Everything comes from `mc_engine.experiments.models`, and its gate runs in CI.
+
+**Merton jump-diffusion** adds Poisson-timed jumps with lognormal sizes to GBM. Conditional on the number of jumps, the log-price is normal, so the closed form is a Poisson-weighted sum of Black–Scholes prices. The simulation is exact, with no time grid, and agrees with the series at every strike (all |z| < 0.8). With negative mean jumps (λ = 0.5/yr, mean log jump −10%), implied vol runs from 22.7% at K = 70 to 17.9% at K = 130.
+
+**Heston stochastic volatility** lets variance follow its own mean-reverting process, correlated with the stock. Its characteristic function is known in closed form ("little Heston trap" form), so European prices follow by Fourier inversion. That pricer is checked against published benchmark values:
+
+| Case (S0 = K = 100, T = 1y, r = 3%, κ = 2, ξ = 0.35, ρ = −0.7) | Benchmark | This repo | Difference |
+|---|---:|---:|---:|
+| v0 = 0.01, θ = 0.04 | 7.85571767 | 7.85571767 | +4.8e−09 |
+| v0 = 0.09, θ = 0.04 | 10.99728901 | 10.99728903 | +1.7e−08 |
+| v0 = 0.04, θ = 0.01 | 7.26603514 | 7.26603498 | −1.6e−07 |
+| v0 = 0.04, θ = 0.09 | 11.56109741 | 11.56109743 | +2.0e−08 |
+
+Benchmarks are from arXiv:2606.13992, Table 4. The largest gap matches the paper's own disagreement between its two methods. Further checks:
+- As vol-of-vol goes to 0, the price converges to Black–Scholes at the effective vol, with the gap shrinking in proportion to ξ.
+- With ρ = −0.7, implied vol runs from 26.6% at K = 70 to 14.2% at K = 130, and QE simulation matches the semi-analytic price at all seven strikes.
+
+![Heston scheme bias](docs/figures/heston_scheme_bias.png)
+
+**Why the simulation scheme matters.** Heston paths can't be simulated exactly with a plain time-stepping scheme. The variance can hit zero, and when the Feller condition 2κθ ≥ ξ² fails it does so constantly. Full-truncation Euler clips the variance at zero and pays for it in bias. Andersen's QE scheme matches the first two moments of each variance step, using a point mass at zero plus an exponential near zero:
+
+| Steps per year (ATM call, T = 10y, 2κθ = 0.04 vs ξ² = 1) | Euler bias | QE bias |
+|---:|---:|---:|
+| 1 | +6.27 (z = +79) | +0.92 (z = +26) |
+| 4 | +2.08 (z = +44) | +0.10 (z = +2.8) |
+| 8 | +1.06 (z = +26) | −0.01 (z = −0.3) |
+| 32 | +0.27 (z = +7) | +0.02 (z = +0.6) |
+
+The true price is 13.0847. Euler's bias halves each time the step count doubles, as a first-order scheme's should, but at 32 steps a year it's still 7σ off. QE is within noise from 8 steps a year.
 
 ### Path-dependent payoffs (Project 1, step 4)
 
@@ -190,7 +223,7 @@ flowchart TB
 | Phase | Scope | Gate | Status |
 |---|---|---|---|
 | 0 · Foundation | Monorepo, CMake + uv, CI with ASan/UBSan, LOBSTER loader | CI green | ✅ done |
-| 1 · Monte Carlo engine | Pricer with error bars ✅ → variance reduction ✅ → Greeks ✅ → Asian/barrier/American (Longstaff–Schwartz) ✅ → Heston → SPY calibration → Numba | MC within its standard error of Black–Scholes | 🟡 step 4 of 7 |
+| 1 · Monte Carlo engine | Pricer with error bars ✅ → variance reduction ✅ → Greeks ✅ → Asian/barrier/American (Longstaff–Schwartz) ✅ → Merton + Heston ✅ → SPY calibration → Numba | MC within its standard error of Black–Scholes | 🟡 step 5 of 7 |
 | 2 · Limit order book | C++20 matching engine, property tests, LOBSTER replay, benchmarks, pybind11 | Rebuilt book matches LOBSTER on every event | ⏳ |
 | 3 · Market maker | Avellaneda–Stoikov, order-flow-imbalance skew, markouts, risk overlay | Walk-forward, out-of-sample, net of fees | ⏳ |
 | 4 · Add-ons | Delta-hedging PnL simulator, Almgren–Chriss execution on the book | — | ⏳ |
@@ -209,6 +242,7 @@ uv run python -m mc_engine.experiments.convergence         # 1/√N figure
 uv run python -m mc_engine.experiments.variance_reduction  # step 2 tables + figure (~20 s)
 uv run python -m mc_engine.experiments.greeks              # step 3 tables + figure
 uv run python -m mc_engine.experiments.path_dependent      # step 4 tables + figure (~20 s)
+uv run python -m mc_engine.experiments.models              # step 5 tables + figure (~25 s)
 ```
 
 C++ core (needs CMake ≥ 3.25 and a C++20 compiler):
@@ -246,6 +280,14 @@ from mc_engine.barrier import price_down_and_out_call
 price_asian(100, 100, 1.0, 0.05, 0.25, n_steps=12, control_variate=True, sampler="sobol")
 price_down_and_out_call(100, 100, 90, 1.0, 0.05, 0.25, n_steps=16)  # bridge-corrected
 lsm_price(36, 40, 1.0, 0.06, 0.2), tree_price(36, 40, 1.0, 0.06, 0.2, exercise=50)
+
+# Beyond GBM
+from mc_engine.heston import HestonParams, heston_price, price_heston_mc
+from mc_engine.implied_vol import implied_vol
+
+p = HestonParams(kappa=2.0, theta=0.04, xi=0.5, rho=-0.7, v0=0.04)
+price = heston_price(100, 90, 1.0, 0.05, p)  # semi-analytic
+implied_vol(price, 100, 90, 1.0, 0.05), price_heston_mc(100, 90, 1.0, 0.05, p, scheme="qe")
 ```
 
 ## Layout
@@ -254,7 +296,8 @@ lsm_price(36, 40, 1.0, 0.06, 0.2), tree_price(36, 40, 1.0, 0.06, 0.2, exercise=5
 quant-stack/
   mc_engine/          Project 1: GBM (exact log step), Black–Scholes, Monte Carlo pricer,
                       variance reduction, Brownian bridge + scrambled Sobol, Greeks,
-                      Asian / barrier / American (Longstaff–Schwartz + binomial reference)
+                      Asian / barrier / American (Longstaff–Schwartz + binomial reference),
+                      Merton jump-diffusion, Heston (semi-analytic, Euler, QE), implied vol
     experiments/      scripts that produce every number in this README
   lob/                Project 2: C++20 core (types today; matching engine next)
   marketdata/         loaders: LOBSTER today; crypto L2 and option chains with later phases
@@ -276,7 +319,8 @@ quant-stack/
 - Barriers: only the down-and-out call with barrier ≤ strike has a closed form here. The bridge correction works for any single barrier, but the other cases have no reference yet.
 - Longstaff–Schwartz gives a lower bound only, with a fixed cubic basis. An Andersen–Broadie duality upper bound would bracket the true price from both sides.
 - Timings come from one machine, single-threaded NumPy. The variance-reduction factors are machine-independent, and the efficiency column is not.
-- GBM dynamics only. Jumps (Merton) and stochastic volatility (Heston) arrive in steps 5 and 6.
+- The QE scheme runs without Andersen's martingale correction, so a small residual drift remains. It's within noise at 8+ steps a year in the test above.
+- Heston prices use adaptive quadrature, one strike at a time: accurate to about 1e-9 but too slow to calibrate on. Step 6 replaces it with a vectorised quadrature for fitting to SPY.
 - The C++ side holds only shared types and the build/test/sanitizer pipeline. The matching engine is Phase 2.
 
 ## License

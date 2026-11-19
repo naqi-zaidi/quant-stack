@@ -32,6 +32,8 @@ jobs:
         run: uv run python -m mc_engine.experiments.greeks --no-figure
       - name: Step 4 gate (Asian, barrier, American vs references)
         run: uv run python -m mc_engine.experiments.path_dependent --no-figure
+      - name: Step 5 gate (Merton, Heston benchmarks and smile)
+        run: uv run python -m mc_engine.experiments.models --no-figure
 
   cpp:
     name: C++ (${{ matrix.preset }})
