@@ -7,13 +7,54 @@
 
 **One market-making research system rather than three separate demos.** A Monte Carlo engine simulates a hidden fair value. Agents send orders around it into a C++20 limit order book. A market maker quotes into that book through a risk layer, and analytics score the result.
 
-> **Status:** Foundation done. Project 1 is at step 3 of 7.
+> **Status:** Foundation done. Project 1 is at step 4 of 7.
+> - **Step 4 (path-dependent):** an arithmetic Asian priced with **16,000× less variance** than plain Monte Carlo; a barrier option with **no monitoring bias at any grid size**; and American puts by Longstaff–Schwartz, **within 1% of a binomial reference**.
 > - **Step 3 (Greeks):** delta and vega from three estimators all land within 4 standard errors of Black–Scholes. The pathwise estimator's known failure on digital options is shown, not hidden.
 > - **Step 2 (variance reduction):** on an at-the-money call at equal path count, variance falls **2.5× (antithetic), 5.3× (control variate) and about 2,200× (randomized Sobol)**.
 >
 > CI runs a gate for every step.
 
 ## Results so far
+
+### Path-dependent payoffs (Project 1, step 4)
+
+Each payoff is checked against a reference that isn't itself Monte Carlo wherever one exists. Everything comes from `mc_engine.experiments.path_dependent`, and its gate runs in CI.
+
+**Asian call (monthly average, S0 = K = 100, σ = 25%, T = 1y).** The geometric-average Asian has an exact closed form, 6.9907. Monte Carlo reproduces it (z = −0.97 pseudo-random, +0.16 Sobol), which validates the path engine. That same closed form then serves as a control variate for the arithmetic average, which has no closed form:
+
+| Arithmetic Asian, 16,384 paths | Variance reduction vs plain | worst \|z\| vs reference, 100 runs |
+|---|---:|---:|
+| Plain MC | 1× | 2.41 |
+| Geometric control variate | 832× | 3.34 |
+| Sobol + Brownian bridge | 392× | 3.71 |
+| Sobol + bridge + control variate | **16,216×** | 2.66 |
+
+The reference is 7.31244 ± 0.00005 (Sobol + bridge + control variate, about 1M paths). The arithmetic price sits above the geometric one, as it must: the arithmetic mean is never below the geometric mean.
+
+**Down-and-out call (S0 = K = 100, barrier 90, continuous monitoring).** A simulated path is only seen on its grid, so it can cross the barrier between grid points without being knocked out. Naive monitoring therefore overprices. The Brownian-bridge correction weights each path by its exact probability of not having crossed between grid points, which removes the bias at any grid size:
+
+![Barrier monitoring bias](docs/figures/barrier_monitoring_bias.png)
+
+| Grid steps | Naive MC | BGK formula (theory) | Bridge-corrected MC | Closed form |
+|---:|---:|---:|---:|---:|
+| 4 | 11.4002 | 11.3652 | 9.1205 (z = +0.20) | 9.1112 |
+| 64 | 9.8975 | 9.8930 | 9.1148 (z = +0.07) | 9.1112 |
+| 256 | 9.5880 | 9.5241 | 9.1191 (z = +0.16) | 9.1112 |
+
+Naive Monte Carlo is not broken. It correctly prices a barrier checked only on the grid, and it agrees with the Broadie–Glasserman–Kou formula for that case to within about one standard error. The gap to continuous monitoring shrinks only slowly: the fitted slope is −0.39, against −0.41 predicted by BGK over the same grids, and −½ only on much finer grids.
+
+**American put (K = 40, r = 6%, T = 1y, 50 exercise dates).** Longstaff–Schwartz regresses future cash flows on cubic polynomials in S/K, using in-the-money paths only. Evaluating the fitted rule on the same paths it was fitted on lets it partly see their futures. So the price uses fresh paths: a rule fitted on one set and applied to an independent set is a true lower bound. The reference is a binomial tree (Black–Scholes smoothing + Richardson extrapolation) with the same 50 exercise dates.
+
+| S0 | σ | European | Bermudan-50 (tree) | American (tree) | LSM out-of-sample | vs tree |
+|---:|---:|---:|---:|---:|---:|---:|
+| 36 | 0.2 | 3.8443 | 4.4778 | 4.4867 | 4.4837 ± 0.0114 | +0.0059 |
+| 36 | 0.4 | 6.7114 | 7.1013 | 7.1090 | 7.0460 ± 0.0234 | −0.0553 |
+| 40 | 0.2 | 2.0664 | 2.3141 | 2.3196 | 2.3241 ± 0.0108 | +0.0100 |
+| 40 | 0.4 | 5.0596 | 5.3120 | 5.3183 | 5.3257 ± 0.0222 | +0.0137 |
+| 44 | 0.2 | 1.0169 | 1.1099 | 1.1130 | 1.1012 ± 0.0081 | −0.0087 |
+| 44 | 0.4 | 3.7828 | 3.9477 | 3.9528 | 3.9304 ± 0.0202 | −0.0173 |
+
+The gate checks two things. No out-of-sample price may sit meaningfully above the tree, since that would break the lower bound. None may sit more than 1% below it, which would mean a poor exercise rule. The worst case is −0.8% (σ = 0.4, S0 = 36). The tree itself matches Black–Scholes to 2e-5 for European exercise, and its American call with no dividends equals the European call, as theory requires.
 
 ### Greeks (Project 1, step 3)
 
@@ -149,7 +190,7 @@ flowchart TB
 | Phase | Scope | Gate | Status |
 |---|---|---|---|
 | 0 · Foundation | Monorepo, CMake + uv, CI with ASan/UBSan, LOBSTER loader | CI green | ✅ done |
-| 1 · Monte Carlo engine | Pricer with error bars ✅ → variance reduction ✅ → Greeks ✅ → Asian/barrier/American (Longstaff–Schwartz) → Heston → SPY calibration → Numba | MC within its standard error of Black–Scholes | 🟡 step 3 of 7 |
+| 1 · Monte Carlo engine | Pricer with error bars ✅ → variance reduction ✅ → Greeks ✅ → Asian/barrier/American (Longstaff–Schwartz) ✅ → Heston → SPY calibration → Numba | MC within its standard error of Black–Scholes | 🟡 step 4 of 7 |
 | 2 · Limit order book | C++20 matching engine, property tests, LOBSTER replay, benchmarks, pybind11 | Rebuilt book matches LOBSTER on every event | ⏳ |
 | 3 · Market maker | Avellaneda–Stoikov, order-flow-imbalance skew, markouts, risk overlay | Walk-forward, out-of-sample, net of fees | ⏳ |
 | 4 · Add-ons | Delta-hedging PnL simulator, Almgren–Chriss execution on the book | — | ⏳ |
@@ -167,6 +208,7 @@ uv run python -m mc_engine.experiments.bs_gate             # step 1 gate tables
 uv run python -m mc_engine.experiments.convergence         # 1/√N figure
 uv run python -m mc_engine.experiments.variance_reduction  # step 2 tables + figure (~20 s)
 uv run python -m mc_engine.experiments.greeks              # step 3 tables + figure
+uv run python -m mc_engine.experiments.path_dependent      # step 4 tables + figure (~20 s)
 ```
 
 C++ core (needs CMake ≥ 3.25 and a C++20 compiler):
@@ -195,6 +237,15 @@ from mc_engine.greeks import mc_greeks
 
 g = mc_greeks(100, 100, 1.0, 0.05, 0.2, kind="call")
 g.delta["pathwise"], g.vega["likelihood_ratio"]
+
+# Path-dependent payoffs
+from mc_engine.american import lsm_price, tree_price
+from mc_engine.asian import price_asian
+from mc_engine.barrier import price_down_and_out_call
+
+price_asian(100, 100, 1.0, 0.05, 0.25, n_steps=12, control_variate=True, sampler="sobol")
+price_down_and_out_call(100, 100, 90, 1.0, 0.05, 0.25, n_steps=16)  # bridge-corrected
+lsm_price(36, 40, 1.0, 0.06, 0.2), tree_price(36, 40, 1.0, 0.06, 0.2, exercise=50)
 ```
 
 ## Layout
@@ -202,7 +253,8 @@ g.delta["pathwise"], g.vega["likelihood_ratio"]
 ```
 quant-stack/
   mc_engine/          Project 1: GBM (exact log step), Black–Scholes, Monte Carlo pricer,
-                      variance reduction, Brownian bridge + scrambled Sobol, Greeks
+                      variance reduction, Brownian bridge + scrambled Sobol, Greeks,
+                      Asian / barrier / American (Longstaff–Schwartz + binomial reference)
     experiments/      scripts that produce every number in this README
   lob/                Project 2: C++20 core (types today; matching engine next)
   marketdata/         loaders: LOBSTER today; crypto L2 and option chains with later phases
@@ -221,7 +273,8 @@ quant-stack/
 
 ## Current limitations
 
-- European payoffs only so far, so the S_T control variate is the simplest one available. Step 4 (Asian options) brings the stronger geometric-Asian control, which has a closed form.
+- Barriers: only the down-and-out call with barrier ≤ strike has a closed form here. The bridge correction works for any single barrier, but the other cases have no reference yet.
+- Longstaff–Schwartz gives a lower bound only, with a fixed cubic basis. An Andersen–Broadie duality upper bound would bracket the true price from both sides.
 - Timings come from one machine, single-threaded NumPy. The variance-reduction factors are machine-independent, and the efficiency column is not.
 - GBM dynamics only. Jumps (Merton) and stochastic volatility (Heston) arrive in steps 5 and 6.
 - The C++ side holds only shared types and the build/test/sanitizer pipeline. The matching engine is Phase 2.
