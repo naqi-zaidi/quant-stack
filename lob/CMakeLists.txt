@@ -6,13 +6,20 @@ target_link_libraries(lob_core PRIVATE qs_options)
 # Position-independent so the same archive can be linked into the pybind11 module (step 5).
 set_target_properties(lob_core PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
-# Step 3 gate: LOBSTER replay (needs a LOBSTER sample in data/, see data/README.md).
-add_executable(lob_replay tools/lob_replay.cpp)
-target_link_libraries(lob_replay PRIVATE lob::core qs_options)
+if(QS_BUILD_TOOLS)
+  # Step 3 gate: LOBSTER replay (needs a LOBSTER sample in data/, see data/README.md).
+  add_executable(lob_replay tools/lob_replay.cpp)
+  target_link_libraries(lob_replay PRIVATE lob::core qs_options)
 
-# Step 4: engine-call latency percentiles on the same real day, map vs array levels.
-add_executable(lob_latency tools/lob_latency.cpp)
-target_link_libraries(lob_latency PRIVATE lob::core qs_options)
+  # Step 4: engine-call latency percentiles on the same real day, map vs array levels.
+  add_executable(lob_latency tools/lob_latency.cpp)
+  target_link_libraries(lob_latency PRIVATE lob::core qs_options)
+endif()
+
+# Step 5: the Python module. Built by `uv sync` through scikit-build-core (see pyproject.toml).
+if(QS_BUILD_PYTHON)
+  add_subdirectory(python)
+endif()
 
 if(QS_BUILD_TESTS)
   add_subdirectory(tests)

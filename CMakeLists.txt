@@ -10,6 +10,8 @@ option(QS_BUILD_TESTS "Build unit tests" ON)
 option(QS_SANITIZE "Build with AddressSanitizer and UndefinedBehaviorSanitizer" OFF)
 option(QS_WERROR "Treat compiler warnings as errors" OFF)
 option(QS_BUILD_BENCHMARKS "Build Google Benchmark microbenchmarks (lob_bench)" OFF)
+option(QS_BUILD_TOOLS "Build the command-line tools (lob_replay, lob_latency)" ON)
+option(QS_BUILD_PYTHON "Build the pybind11 module (orderbook._lob); uv sync turns this on" OFF)
 
 # Warnings and sanitizers go on one interface target so third-party code
 # (GoogleTest) is not built with -Werror.

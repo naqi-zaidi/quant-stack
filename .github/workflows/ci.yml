@@ -13,12 +13,18 @@ jobs:
   python:
     name: Python (lint + tests)
     runs-on: ubuntu-latest
+    env:
+      # uv's own CPython builds ship their C headers, which the order book module compiles
+      # against; the runner's system Python may not have them installed.
+      UV_PYTHON_PREFERENCE: only-managed
     steps:
       - uses: actions/checkout@v5
-      - uses: astral-sh/setup-uv@v6
+      - uses: astral-sh/setup-uv@v10.3.2  # v10 runs on Node 24 (v6 was Node 20, deprecated)
         with:
           enable-cache: true
-      - name: Install pinned environment
+      - name: Install pinned environment (builds the C++ order book module, warnings as errors)
+        env:
+          SKBUILD_CMAKE_DEFINE: QS_WERROR=ON
         run: uv sync --locked
       - name: Lint
         run: uv run ruff check .
@@ -38,6 +44,8 @@ jobs:
         run: uv run python -m mc_engine.experiments.calibration --no-figure
       - name: Step 7 gate (Numba kernels correct; throughput printed for this runner)
         run: uv run python -m mc_engine.experiments.speed
+      - name: Phase 2 step 5 gate (Python module reproduces the C++ engine event for event)
+        run: uv run python -m orderbook.gate
 
   cpp:
     name: C++ (${{ matrix.preset }})

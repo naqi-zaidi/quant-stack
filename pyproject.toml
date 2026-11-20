@@ -21,12 +21,36 @@ dev = [
     "matplotlib>=3.9",
 ]
 
+# scikit-build-core builds the C++ order book into the `orderbook` package (Project 2 step 5),
+# so `uv sync` compiles it: a C++20 compiler and CMake >= 3.25 are needed.
 [build-system]
-requires = ["hatchling"]
-build-backend = "hatchling.build"
+requires = ["scikit-build-core>=0.11", "pybind11>=3.0"]
+build-backend = "scikit_build_core.build"
 
-[tool.hatch.build.targets.wheel]
-packages = ["mc_engine", "marketdata"]
+[tool.scikit-build]
+minimum-version = "build-system.requires"
+cmake.version = ">=3.25"
+cmake.build-type = "Release"
+wheel.packages = ["mc_engine", "marketdata", "lob/python/orderbook"]
+build-dir = "build/py/{wheel_tag}"
+
+[tool.scikit-build.cmake.define]
+QS_BUILD_PYTHON = "ON"
+QS_BUILD_TESTS = "OFF"
+QS_BUILD_TOOLS = "OFF"
+QS_BUILD_BENCHMARKS = "OFF"
+
+# Rebuild the module whenever the C++ changes (uv otherwise reuses the last build).
+[tool.uv]
+cache-keys = [
+    { file = "pyproject.toml" },
+    { file = "CMakeLists.txt" },
+    { file = "lob/CMakeLists.txt" },
+    { file = "lob/include/**/*.hpp" },
+    { file = "lob/src/**/*.cpp" },
+    { file = "lob/python/CMakeLists.txt" },
+    { file = "lob/python/*.cpp" },
+]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
@@ -36,6 +60,7 @@ addopts = "-q"
 line-length = 100
 target-version = "py312"
 extend-exclude = ["build"]
+src = [".", "lob/python"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "B", "UP", "NPY"]

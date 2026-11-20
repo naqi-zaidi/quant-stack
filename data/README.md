@@ -42,6 +42,18 @@ and that the reference book is never crossed. A file that fails any check raises
    `./build/release/lob/lob_latency <same file>` times every engine call on that day for both
    books (the Phase 2 step 4 latency tables).
 
+5. Or replay it from Python (Phase 2 step 5). Nothing beyond `uv sync` is needed:
+
+   ```
+   uv run python -m orderbook.gate      # picks up the first LOBSTER day in data/
+   ```
+
+   ```python
+   from orderbook.lobster import ArrayReplay
+   stats = ArrayReplay(levels=10, tick=100).run("data/AAPL_2012-06-21_34200000_57600000_message_10.csv")
+   stats.mismatches  # 0
+   ```
+
 ## SPY option-chain snapshot (committed)
 
 `snapshots/spy_options_2026-11-19.csv.gz` is the yfinance snapshot taken 2026-11-19 at

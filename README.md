@@ -8,6 +8,7 @@
 **One market-making research system rather than three separate demos.** A Monte Carlo engine simulates a hidden fair value. Agents send orders around it into a C++20 limit order book. A market maker quotes into that book through a risk layer, and analytics score the result.
 
 > **Status:** Foundation done. **Project 1 (Monte Carlo engine) is complete.** **Phase 2, the C++20 limit order book, is under way.**
+> - **Project 2, step 5 (Python module):** `uv sync` builds the engine into a Python package, `orderbook`. From Python, it reproduces all ten C++ golden transcripts byte for byte and hashes to the pinned C++ digests. Replaying the AAPL day from Python gives 0 mismatches and the same 1,283,305-event digest as the C++ replay. A call costs about 0.3 µs from Python.
 > - **Project 2, step 4 (benchmarks):** a tick-indexed array of price levels makes the steady-state hot path allocation-free, closes a level 4.0× faster than an ordered map (31 vs 122 ns) and opens one 1.6× faster. On real AAPL flow, a delete takes about 40% less time at the median. It reproduces every golden transcript and pinned digest from step 3.5 byte for byte.
 > - **Project 2, step 3.5 (snapshot tests, pinned digests):** ten golden-file scenarios print the whole book and every event, and the event stream's FNV-1a digest is pinned for 18 fixed flows. Both are fixed before the level structure changes in step 4, which must reproduce them byte for byte.
 > - **Project 2, step 3 (LOBSTER replay):** the engine rebuilt Nasdaq's AAPL book for 2012-06-21 and matched LOBSTER's 10-level book after all 400,390 events, with zero mismatches. 99.89% of Nasdaq's visible executions were reproduced by the engine's own matcher.
@@ -25,6 +26,68 @@
 > CI runs a gate for every step.
 
 ## Results so far
+
+### Limit order book: Python module (Project 2, step 5)
+
+**`uv sync` now compiles the C++ engine into a Python package, `orderbook`, and the engine behaves the same through it, byte for byte.** scikit-build-core drives CMake and pybind11 3.1, and the extension links the same `lob_core` library as the C++ tools. One `uv sync` sets up Project 1 and the order book together. Project 3's market maker will drive the book from Python through this module.
+
+```python
+from orderbook import ArrayOrderBook, OrderType, Side
+from orderbook.lobster import ArrayReplay
+
+book = ArrayOrderBook(tick_size=100)  # integer ticks: $585.33 is 5_853_300
+book.submit(1, Side.Sell, 5_853_300, 100)
+book.submit(2, Side.Buy, 5_853_300, 40, OrderType.IOC)
+# orderbook.Result(accepted=True, reason=<Reason.None_: 0>, filled=40, resting=0, cancelled=0)
+book.take_events()     # Trade, LevelUpdate, ExecReport named tuples, in arrival order
+book.depth(Side.Sell)  # [orderbook.LevelView(price=5853300, qty=60, count=1)]
+
+ArrayReplay(levels=10, tick=100).run("data/AAPL_2012-06-21_34200000_57600000_message_10.csv")
+# ReplayStats(events=400390, mismatches=0, errors=0, comparisons=8007800)
+```
+
+**Gate** (`uv run python -m orderbook.gate`, in CI):
+
+| Check | Result |
+|---|---|
+| Golden transcripts. Each scripted scenario is parsed back into its calls and re-run from Python, then printed by `orderbook.text`, a Python formatter written independently of `text.hpp`. The LOBSTER-day transcript is rebuilt through `orderbook.lobster` | 10 of 10 identical byte for byte, on both books |
+| Pinned digest of the hand-built LOBSTER day | `0xf4560d597b3dde88`, both books: the value in `pinned_digests.hpp`, both from C++ and from Python's own FNV-1a over the events it received |
+| Random flows: 5 regimes × 10,000 calls, map book vs array book, including invalid calls | 50,000 calls, 33,258 accepted, 17,174 trades, 141,472 events. 0 disagreements in results or events, quantity conserved, never crossed. Python's FNV-1a equals the C++ digest |
+
+pytest adds 40 tests (246 in total). They include a Hypothesis test: 300 random call sequences on which both books must agree, and edge cases such as 64-bit ids at 2⁶⁴−1, bad argument types, a replay from LOBSTER files on disk, and the docstring examples. Two planted binding bugs are each caught by both pytest and the gate: taker and maker swapped in the `Trade` conversion, and level updates dropped from the recorded events.
+
+**The real AAPL day, replayed from Python** (local only; median [min–max] of 5 interleaved runs):
+
+| How | Events | Mismatches | Book events | Digest | Map book | Array book |
+|---|---:|---:|---:|---|---:|---:|
+| `run()`: whole day in C++, GIL released | 400,390 | 0 | 1,283,305 | `0x089e41b222534921` | 0.575 s [0.571–0.627] | 0.584 s [0.550–0.626] |
+| `step()` per event, from a Python loop over `DayReader` | 400,390 | 0 | 1,283,305 | `0x089e41b222534921` | 1.06 s [1.01–1.07] | 0.99 s [0.96–1.05] |
+
+The digest is `lob_replay`'s from step 3. `run()` takes about as long as the C++ command-line tool (`lob_replay --array`, 0.61–0.71 s wall-clock including process start). Driving each event from Python adds about 1.1 µs per event.
+
+**What a call costs from Python.** Submit + cancel pairs at a standing level, 2 events per call, median [min–max] of 7 runs, in ns per call:
+
+| Events | Array book | Map book |
+|---|---:|---:|
+| recorded, collected after every pair, digest on (the defaults) | 625 [617–772] | 604 [585–625] |
+| digest only (`record_events=False`) | 337 [326–486] | 332 [322–340] |
+| neither (`digest_events=False` too) | 270 [266–279] | 270 [260–283] |
+| empty Python function in the same loop, for scale | 54 [53–56] | |
+
+In C++ the same calls cost about 35 ns (step 4, array book: add 43.5 ns, cancel 25.3 ns), so nearly all of the ~270 ns is spent crossing the boundary. Timings are machine-specific and are not gated.
+
+**Finding: the first build cost ~710 ns per call (digest on, recording off), and the engine was not the cause.** Two binding costs were:
+- pybind11's generic enum conversion (`native_enum`) reads each member's `.value` property through Python, about 300 ns per enum argument;
+- returning a pybind11 class instance, which heap-copies the value and registers the instance, cost about 165 ns.
+
+The module now creates the enums with Python's `enum` module and converts them directly, since an `IntEnum` member is already an int. It also builds results, views and events as C-API named tuples (`PyStructSequence`). The cost fell to ~335 ns.
+
+**Design.**
+- Events stay in a C++ vector until `take_events()`. The digest folds in every event as it happens. Both can be switched off (`record_events`, `digest_events`).
+- `Result`, `LevelView`, `OrderView`, `Trade`, `LevelUpdate` and `ExecReport` are named tuples: immutable, picklable and usable in `match`. `orderbook.text` prints them exactly as the C++ does.
+- `Side`, `OrderType`, `ExecType`, `Reason` and `lobster.Event` are real `enum.IntEnum`s, and a plain int is rejected where a `Side` is expected. C++ `Reason::None` is `Reason.None_`, because `None` is a Python keyword.
+- `Replay.book` is a read-only view that keeps its replay alive. `Replay.run()` releases the GIL for the whole day.
+- Build: `-O3` with LTO. CI compiles the module with `-Werror`, and `tool.uv.cache-keys` rebuilds it whenever the C++ changes.
 
 ### Limit order book: benchmarks, map vs array price levels (Project 2, step 4)
 
@@ -533,13 +596,13 @@ flowchart TB
 |---|---|---|---|
 | 0 · Foundation | Monorepo, CMake + uv, CI with ASan/UBSan, LOBSTER loader | CI green | ✅ done |
 | 1 · Monte Carlo engine | Pricer with error bars ✅ → variance reduction ✅ → Greeks ✅ → Asian/barrier/American (Longstaff–Schwartz) ✅ → Merton + Heston ✅ → SPY calibration ✅ → Numba ✅ | MC within its standard error of Black–Scholes | ✅ done |
-| 2 · Limit order book | Matching engine ✅ → property tests ✅ → LOBSTER replay ✅ → snapshot tests + pinned digests ✅ → benchmarks ✅ → pybind11 → microstructure analytics | Rebuilt book matches LOBSTER on every event ✅ (AAPL: 400,390 events, 0 mismatches) | 🔨 in progress |
+| 2 · Limit order book | Matching engine ✅ → property tests ✅ → LOBSTER replay ✅ → snapshot tests + pinned digests ✅ → benchmarks ✅ → pybind11 module ✅ → microstructure analytics | Rebuilt book matches LOBSTER on every event ✅ (AAPL: 400,390 events, 0 mismatches) | 🔨 in progress |
 | 3 · Market maker | Avellaneda–Stoikov, order-flow-imbalance skew, markouts, risk overlay | Walk-forward, out-of-sample, net of fees | ⏳ |
 | 4 · Add-ons | Delta-hedging PnL simulator, Almgren–Chriss execution on the book | — | ⏳ |
 
 ## Quickstart
 
-Requires [uv](https://docs.astral.sh/uv/). It fetches Python 3.12 and the pinned dependencies from `uv.lock`.
+Requires [uv](https://docs.astral.sh/uv/), a C++20 compiler and CMake ≥ 3.25. uv fetches Python 3.12 and the pinned dependencies from `uv.lock`, and `uv sync` also compiles the order book into the `orderbook` package (about 20 s the first time). On Windows that needs Visual Studio Build Tools.
 
 ```bash
 git clone https://github.com/naqi-zaidi/quant-stack.git
@@ -554,6 +617,7 @@ uv run python -m mc_engine.experiments.path_dependent      # step 4 tables + fig
 uv run python -m mc_engine.experiments.models              # step 5 tables + figure (~25 s)
 uv run python -m mc_engine.experiments.calibration         # step 6: Heston fit to SPY (~20 s)
 uv run python -m mc_engine.experiments.speed               # step 7: NumPy vs Numba throughput (~30 s)
+uv run python -m orderbook.gate                            # Phase 2 step 5: Python module gate (~10 s)
 ```
 
 C++ core (needs CMake ≥ 3.25 and a C++20 compiler):
@@ -590,6 +654,14 @@ book.depth(Side::Sell, 10);            // best-first L2 levels
 ```
 
 ```python
+from orderbook import OrderBook, Side
+from orderbook.text import book_text
+
+book = OrderBook()
+book.submit(1, Side.Sell, 101, 10)
+book.modify(1, 101, 6)        # size down at the same price: keeps queue priority
+print(book_text(book))        # the ladder, as in the golden transcripts
+
 from mc_engine import price_european, bs_price
 
 res = price_european(s0=100, k=100, t=1.0, r=0.05, sigma=0.2, n_paths=1_000_000, seed=0)
@@ -650,6 +722,8 @@ quant-stack/
     experiments/      scripts that produce every number in this README
   lob/                Project 2: C++20 matching engine (order_book) over map or array price
                       levels (levels), id map, object pool, event stream, LOBSTER replay
+    python/           pybind11 bindings (bindings.cpp) and the `orderbook` package:
+                      lobster replay, text formatter, step 5 gate (gate.py)
     tools/            lob_replay (step 3 gate), lob_latency (step 4, real-flow latency)
     bench/            lob_bench: Google Benchmark microbenchmarks, map vs array
     tests/            GoogleTest suite, reference model, property harness + shrinker,
@@ -660,7 +734,7 @@ quant-stack/
   tests/              pytest + Hypothesis property tests
   data/               market data: committed snapshots in data/snapshots/, the rest git-ignored
   docs/figures/       figures referenced above
-  .github/workflows/  CI: lint, tests, gate, C++ under ASan/UBSan and Release
+  .github/workflows/  CI: lint, tests, gates, C++ under ASan/UBSan and Release
 ```
 
 ## Standards every component meets
@@ -685,6 +759,8 @@ quant-stack/
 - Order book: single-threaded, no self-trade prevention, no hidden or iceberg orders. Post-only orders are rejected rather than re-priced when they would cross.
 - LOBSTER replay: validated on one stock-day. More LOBSTER sample days (MSFT, for example) would broaden it. The real-data gate runs locally, not in CI, because the sample can't be redistributed.
 - Order book tests: the reference model and the engine share an author, so a misreading of the matching rules common to both would pass the comparison. The planted bugs show the checks can catch errors; they don't prove the rules match an exchange's. Step 3's replay against real Nasdaq data is that outside check.
+- Python module: crossing into C++ costs about 0.3 µs a call, so a strategy that sends millions of orders spends most of its engine time on the boundary. A batch call taking arrays would amortise it; it isn't built. Each book or replay belongs to one thread.
+- `uv sync` now compiles C++, so a fresh clone needs a compiler and CMake as well as uv. CI builds and tests the module on Linux only.
 - Order book: if memory runs out while opening a new level, the book stays internally consistent but drops that order's unfilled remainder. Sizing the pool and id map up front keeps every other allocation off the trading path.
 
 ## License
