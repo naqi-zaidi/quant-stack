@@ -10,6 +10,7 @@ add_executable(lob_tests
   test_lobster.cpp
   test_golden.cpp
   test_digest.cpp
+  test_levels.cpp
 )
 target_link_libraries(lob_tests PRIVATE lob::core qs_options GTest::gtest_main)
 # Snapshot tests read and (with UPDATE_GOLDEN=1) write lob/tests/golden/*.txt.
@@ -19,3 +20,10 @@ gtest_discover_tests(lob_tests)
 # Step 2 gate: the property suite at scale, plus the planted-bug table for the README.
 add_executable(lob_property_report property_report.cpp)
 target_link_libraries(lob_property_report PRIVATE lob::core qs_options)
+
+# Step 4 gate: heap allocations inside engine calls (replaces global operator new/delete).
+# Not built under sanitizers, which replace the allocator themselves.
+if(NOT QS_SANITIZE)
+  add_executable(lob_alloc_check alloc_check.cpp)
+  target_link_libraries(lob_alloc_check PRIVATE lob::core qs_options)
+endif()

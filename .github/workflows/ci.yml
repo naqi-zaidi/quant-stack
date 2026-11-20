@@ -57,3 +57,9 @@ jobs:
       - name: Phase 2 step 2 gate (order book holds every property; every planted bug caught)
         if: matrix.preset == 'release'
         run: ./build/release/lob/tests/lob_property_report
+      - name: Phase 2 step 4 gate (steady state allocation-free on the array book; map allocates only per new level)
+        if: matrix.preset == 'release'
+        run: ./build/release/lob/tests/lob_alloc_check
+      - name: Phase 2 step 4 smoke (benchmarks build and run; timings are machine-specific)
+        if: matrix.preset == 'release'
+        run: ./build/release/lob/lob_bench --benchmark_min_time=0.01s

@@ -9,6 +9,7 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 option(QS_BUILD_TESTS "Build unit tests" ON)
 option(QS_SANITIZE "Build with AddressSanitizer and UndefinedBehaviorSanitizer" OFF)
 option(QS_WERROR "Treat compiler warnings as errors" OFF)
+option(QS_BUILD_BENCHMARKS "Build Google Benchmark microbenchmarks (lob_bench)" OFF)
 
 # Warnings and sanitizers go on one interface target so third-party code
 # (GoogleTest) is not built with -Werror.
@@ -38,6 +39,21 @@ if(QS_BUILD_TESTS)
   set(INSTALL_GTEST OFF CACHE BOOL "" FORCE)
   FetchContent_MakeAvailable(googletest)
   include(GoogleTest)
+endif()
+
+if(QS_BUILD_BENCHMARKS)
+  include(FetchContent)
+  FetchContent_Declare(
+    benchmark
+    URL https://github.com/google/benchmark/archive/refs/tags/v1.9.1.tar.gz
+    DOWNLOAD_EXTRACT_TIMESTAMP TRUE
+  )
+  set(BENCHMARK_ENABLE_TESTING OFF CACHE BOOL "" FORCE)
+  set(BENCHMARK_ENABLE_GTEST_TESTS OFF CACHE BOOL "" FORCE)
+  set(BENCHMARK_ENABLE_INSTALL OFF CACHE BOOL "" FORCE)
+  set(BENCHMARK_INSTALL_DOCS OFF CACHE BOOL "" FORCE)
+  set(BENCHMARK_ENABLE_WERROR OFF CACHE BOOL "" FORCE)
+  FetchContent_MakeAvailable(benchmark)
 endif()
 
 add_subdirectory(lob)

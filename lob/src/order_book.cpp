@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cassert>
 #include <sstream>
+#include <stdexcept>
 
 namespace lob {
 
@@ -38,17 +39,30 @@ void unlink(Level& lvl, OrderNode* n) noexcept {
   n->level = nullptr;
 }
 
+std::int64_t checked_tick(std::int64_t tick) {
+  if (tick <= 0) throw std::invalid_argument("tick_size must be positive");
+  return tick;
+}
+
 }  // namespace
 
-OrderBook::OrderBook(Listener* listener, std::size_t expected_orders)
-    : listener_(listener), pool_(expected_orders), index_(expected_orders) {}
+template <typename L>
+BasicOrderBook<L>::BasicOrderBook(Listener* listener, std::size_t expected_orders,
+                                  std::int64_t tick_size)
+    : listener_(listener),
+      tick_(checked_tick(tick_size)),
+      bids_(tick_size),
+      asks_(tick_size),
+      pool_(expected_orders),
+      index_(expected_orders) {}
 
 // ---------------------------------------------------------------- order entry
 
-Result OrderBook::submit(const Order& o) {
+template <typename L>
+Result BasicOrderBook<L>::submit(const Order& o) {
   const Price limit = needs_price(o.type) ? o.price : Price{};
   if (o.qty <= 0) return reject(o.id, o.side, limit, Reason::InvalidQuantity, o.ts);
-  if (needs_price(o.type) && o.price.ticks <= 0) {
+  if (needs_price(o.type) && !valid_price(o.side, o.price)) {
     return reject(o.id, o.side, limit, Reason::InvalidPrice, o.ts);
   }
   if (index_.find(o.id) != nullptr) {
@@ -80,7 +94,8 @@ Result OrderBook::submit(const Order& o) {
   return r;
 }
 
-Result OrderBook::cancel(OrderId id, Timestamp ts) {
+template <typename L>
+Result BasicOrderBook<L>::cancel(OrderId id, Timestamp ts) {
   OrderNode* n = index_.find(id);
   if (n == nullptr) return reject(id, Side::Buy, Price{}, Reason::UnknownOrder, ts);
   const OrderNode copy = *n;
@@ -90,11 +105,14 @@ Result OrderBook::cancel(OrderId id, Timestamp ts) {
   return Result{.accepted = true, .cancelled = copy.qty};
 }
 
-Result OrderBook::modify(OrderId id, Price new_price, Quantity new_qty, Timestamp ts) {
+template <typename L>
+Result BasicOrderBook<L>::modify(OrderId id, Price new_price, Quantity new_qty, Timestamp ts) {
   OrderNode* n = index_.find(id);
   if (n == nullptr) return reject(id, Side::Buy, new_price, Reason::UnknownOrder, ts);
   if (new_qty <= 0) return reject(id, n->side, new_price, Reason::InvalidQuantity, ts);
-  if (new_price.ticks <= 0) return reject(id, n->side, new_price, Reason::InvalidPrice, ts);
+  if (!valid_price(n->side, new_price)) {
+    return reject(id, n->side, new_price, Reason::InvalidPrice, ts);
+  }
 
   const Side side = n->side;
   const OrderType type = n->type;
@@ -126,40 +144,47 @@ Result OrderBook::modify(OrderId id, Price new_price, Quantity new_qty, Timestam
   return r;
 }
 
-Result OrderBook::reject(OrderId id, Side side, Price price, Reason reason, Timestamp ts) const {
+template <typename L>
+Result BasicOrderBook<L>::reject(OrderId id, Side side, Price price, Reason reason,
+                                 Timestamp ts) const {
   emit(ExecReport{id, ExecType::Rejected, reason, side, price, 0, 0, ts});
   return Result{.accepted = false, .reason = reason};
 }
 
 // ---------------------------------------------------------------- matching
 
-bool OrderBook::would_cross(Side side, Price limit) const noexcept {
+template <typename L>
+bool BasicOrderBook<L>::would_cross(Side side, Price limit) const noexcept {
   return on_side(opposite(side), [&](const auto& opp) {
     return !opp.empty() && crosses(side, limit, opp.best().price);
   });
 }
 
-Quantity OrderBook::available(Side side, Price limit, Quantity needed) const noexcept {
+template <typename L>
+Quantity BasicOrderBook<L>::available(Side side, Price limit, Quantity needed) const noexcept {
   return on_side(opposite(side), [&](const auto& opp) {
     Quantity sum = 0;
-    for (auto it = opp.begin(); it != opp.end() && sum < needed; ++it) {
-      if (!crosses(side, limit, it->first)) break;
-      sum += it->second.total;
-    }
+    opp.walk([&](const Level& lvl) {
+      if (!crosses(side, limit, lvl.price)) return false;
+      sum += lvl.total;
+      return sum < needed;
+    });
     return sum;
   });
 }
 
-Quantity OrderBook::match(OrderId taker, Side side, OrderType type, Price limit, Quantity qty,
-                          Timestamp ts) {
+template <typename L>
+Quantity BasicOrderBook<L>::match(OrderId taker, Side side, OrderType type, Price limit,
+                                  Quantity qty, Timestamp ts) {
   return on_side(opposite(side), [&](auto& opp) {
     return match_against(opp, taker, side, type, limit, qty, ts);
   });
 }
 
+template <typename L>
 template <typename Opp>
-Quantity OrderBook::match_against(Opp& opp, OrderId taker, Side side, OrderType type,
-                                  Price limit, Quantity qty, Timestamp ts) {
+Quantity BasicOrderBook<L>::match_against(Opp& opp, OrderId taker, Side side, OrderType type,
+                                          Price limit, Quantity qty, Timestamp ts) {
   Quantity remaining = qty;
   while (remaining > 0 && !opp.empty()) {
     Level& lvl = opp.best();
@@ -191,13 +216,15 @@ Quantity OrderBook::match_against(Opp& opp, OrderId taker, Side side, OrderType 
 
 // ---------------------------------------------------------------- resting orders
 
-void OrderBook::reserve_one() {
+template <typename L>
+void BasicOrderBook<L>::reserve_one() {
   pool_.ensure_free(1);
   index_.reserve(index_.size() + 1);
 }
 
-void OrderBook::rest(OrderId id, Side side, OrderType type, Price price, Quantity qty,
-                     Timestamp ts) {
+template <typename L>
+void BasicOrderBook<L>::rest(OrderId id, Side side, OrderType type, Price price, Quantity qty,
+                             Timestamp ts) {
   OrderNode* n = pool_.allocate();  // free slot guaranteed by reserve_one()
   Level* lvl = nullptr;
   try {
@@ -213,7 +240,8 @@ void OrderBook::rest(OrderId id, Side side, OrderType type, Price price, Quantit
   emit(LevelUpdate{side, price, lvl->total, lvl->count, ts});
 }
 
-void OrderBook::remove(OrderNode* n, Timestamp ts) {
+template <typename L>
+void BasicOrderBook<L>::remove(OrderNode* n, Timestamp ts) {
   Level& lvl = *n->level;
   const Side side = n->side;
   const Price price = lvl.price;
@@ -226,17 +254,20 @@ void OrderBook::remove(OrderNode* n, Timestamp ts) {
 
 // ---------------------------------------------------------------- views
 
-std::optional<Price> OrderBook::best_bid() const noexcept {
+template <typename L>
+std::optional<Price> BasicOrderBook<L>::best_bid() const noexcept {
   if (bids_.empty()) return std::nullopt;
   return bids_.best().price;
 }
 
-std::optional<Price> OrderBook::best_ask() const noexcept {
+template <typename L>
+std::optional<Price> BasicOrderBook<L>::best_ask() const noexcept {
   if (asks_.empty()) return std::nullopt;
   return asks_.best().price;
 }
 
-std::optional<LevelView> OrderBook::best(Side side) const noexcept {
+template <typename L>
+std::optional<LevelView> BasicOrderBook<L>::best(Side side) const noexcept {
   return on_side(side, [](const auto& s) -> std::optional<LevelView> {
     if (s.empty()) return std::nullopt;
     const Level& l = s.best();
@@ -244,18 +275,22 @@ std::optional<LevelView> OrderBook::best(Side side) const noexcept {
   });
 }
 
-std::vector<LevelView> OrderBook::depth(Side side, std::size_t max_levels) const {
+template <typename L>
+std::vector<LevelView> BasicOrderBook<L>::depth(Side side, std::size_t max_levels) const {
   return on_side(side, [&](const auto& s) {
     std::vector<LevelView> out;
     out.reserve(std::min(max_levels, s.size()));
-    for (auto it = s.begin(); it != s.end() && out.size() < max_levels; ++it) {
-      out.push_back(LevelView{it->first, it->second.total, it->second.count});
-    }
+    if (max_levels == 0) return out;
+    s.walk([&](const Level& l) {
+      out.push_back(LevelView{l.price, l.total, l.count});
+      return out.size() < max_levels;
+    });
     return out;
   });
 }
 
-std::vector<OrderId> OrderBook::queue(Side side, Price price) const {
+template <typename L>
+std::vector<OrderId> BasicOrderBook<L>::queue(Side side, Price price) const {
   return on_side(side, [&](const auto& s) {
     std::vector<OrderId> ids;
     if (const Level* l = s.find(price)) {
@@ -266,53 +301,66 @@ std::vector<OrderId> OrderBook::queue(Side side, Price price) const {
   });
 }
 
-std::vector<OrderView> OrderBook::orders(Side side) const {
+template <typename L>
+std::vector<OrderView> BasicOrderBook<L>::orders(Side side) const {
   return on_side(side, [](const auto& s) {
     std::vector<OrderView> out;
-    for (const auto& [price, lvl] : s) {
+    s.walk([&](const Level& lvl) {
       for (const OrderNode* n = lvl.head; n != nullptr; n = n->next) {
         out.push_back(OrderView{n->id, n->side, n->type, n->price, n->qty, n->ts});
       }
-    }
+      return true;
+    });
     return out;
   });
 }
 
-std::optional<OrderView> OrderBook::find(OrderId id) const noexcept {
+template <typename L>
+std::optional<OrderView> BasicOrderBook<L>::find(OrderId id) const noexcept {
   const OrderNode* n = index_.find(id);
   if (n == nullptr) return std::nullopt;
   return OrderView{n->id, n->side, n->type, n->price, n->qty, n->ts};
 }
 
-std::size_t OrderBook::level_count(Side side) const noexcept {
+template <typename L>
+std::size_t BasicOrderBook<L>::level_count(Side side) const noexcept {
   return side == Side::Buy ? bids_.size() : asks_.size();
 }
 
-Quantity OrderBook::resting_qty(Side side) const noexcept {
+template <typename L>
+Quantity BasicOrderBook<L>::resting_qty(Side side) const noexcept {
   return on_side(side, [](const auto& s) {
     Quantity sum = 0;
-    for (const auto& [price, lvl] : s) sum += lvl.total;
+    s.walk([&](const Level& lvl) {
+      sum += lvl.total;
+      return true;
+    });
     return sum;
   });
 }
 
 // ---------------------------------------------------------------- self-check
 
-std::string OrderBook::validate() const {
+template <typename L>
+std::string BasicOrderBook<L>::validate() const {
   std::ostringstream err;
   std::size_t nodes = 0;
 
   auto check_side = [&](const auto& s, Side side) {
-    for (const auto& [price, lvl] : s) {
-      if (lvl.price != price) {
-        err << to_string(side) << " level keyed " << price.ticks << " holds price "
-            << lvl.price.ticks;
-        return;
-      }
-      if (lvl.count == 0 || lvl.head == nullptr) {
+    std::size_t levels = 0;
+    const Level* prev_lvl = nullptr;
+    s.walk([&](const Level& lvl) {
+      ++levels;
+      const Price price = lvl.price;
+      if (prev_lvl != nullptr && !better(side, prev_lvl->price, price)) {
+        err << to_string(side) << " levels out of priority order at " << price.ticks;
+      } else if (s.find(price) != &lvl) {
+        err << to_string(side) << " level " << price.ticks << " not found at its own price";
+      } else if (lvl.count == 0 || lvl.head == nullptr) {
         err << to_string(side) << " level " << price.ticks << " is empty but present";
-        return;
       }
+      if (err.tellp() > 0) return false;
+      prev_lvl = &lvl;
       Quantity total = 0;
       std::uint32_t count = 0;
       const OrderNode* prev = nullptr;
@@ -328,7 +376,7 @@ std::string OrderBook::validate() const {
         else if (prev != nullptr && prev->seq >= n->seq)
           err << "order " << n->id << ": FIFO violated at " << price.ticks;
         else if (index_.find(n->id) != n) err << "order " << n->id << ": index mismatch";
-        if (err.tellp() > 0) return;
+        if (err.tellp() > 0) return false;
       }
       if (lvl.tail != prev) err << to_string(side) << " level " << price.ticks << ": bad tail";
       else if (total != lvl.total)
@@ -337,7 +385,10 @@ std::string OrderBook::validate() const {
       else if (count != lvl.count)
         err << to_string(side) << " level " << price.ticks << ": count " << lvl.count
             << " != " << count;
-      if (err.tellp() > 0) return;
+      return err.tellp() == 0;
+    });
+    if (err.tellp() == 0 && levels != s.size()) {
+      err << to_string(side) << " side reports " << s.size() << " levels, walked " << levels;
     }
   };
 
@@ -356,5 +407,8 @@ std::string OrderBook::validate() const {
   }
   return err.str();
 }
+
+template class BasicOrderBook<MapLevels>;
+template class BasicOrderBook<ArrayLevels>;
 
 }  // namespace lob

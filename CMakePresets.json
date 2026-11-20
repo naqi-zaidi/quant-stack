@@ -20,11 +20,12 @@
     },
     {
       "name": "release",
-      "displayName": "Release, warnings as errors",
+      "displayName": "Release, warnings as errors, benchmarks",
       "binaryDir": "${sourceDir}/build/release",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Release",
-        "QS_WERROR": "ON"
+        "QS_WERROR": "ON",
+        "QS_BUILD_BENCHMARKS": "ON"
       }
     }
   ],

@@ -38,6 +38,10 @@ and that the reference book is never crossed. A file that fails any check raises
    message file works if its orderbook file sits next to it; the level count comes from the
    file name.
 
+   Add `--array` to replay on the tick-indexed array book instead of the map book.
+   `./build/release/lob/lob_latency <same file>` times every engine call on that day for both
+   books (the Phase 2 step 4 latency tables).
+
 ## SPY option-chain snapshot (committed)
 
 `snapshots/spy_options_2026-11-19.csv.gz` is the yfinance snapshot taken 2026-11-19 at

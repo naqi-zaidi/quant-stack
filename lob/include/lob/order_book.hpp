@@ -3,8 +3,9 @@
 // Single-threaded price-time priority limit order book and matching engine.
 //
 // Layout
-//   - Each side is an ordered map from price to Level, best price first. (Phase 2 step 4
-//     benchmarks this against a tick-indexed array.)
+//   - Each side holds its price levels best price first, in one of two stores (levels.hpp):
+//     an ordered map (OrderBook) or a tick-indexed array (ArrayOrderBook). The engine code
+//     is shared; step 4 benchmarks the two.
 //   - Each Level is an intrusive doubly linked FIFO of resting orders: append at the tail,
 //     match from the head, unlink anywhere in O(1).
 //   - Order nodes come from a fixed-address pool, and an open-addressing id map points
@@ -27,40 +28,17 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
-#include <map>
 #include <optional>
 #include <string>
 #include <vector>
 
 #include "lob/events.hpp"
 #include "lob/id_map.hpp"
+#include "lob/levels.hpp"
 #include "lob/object_pool.hpp"
 #include "lob/types.hpp"
 
 namespace lob {
-
-struct Level;
-
-struct OrderNode {
-  OrderId id{};
-  Price price{};
-  Quantity qty{};      // open (unfilled) quantity
-  Timestamp ts{};      // event time of the message that gave the order its current priority
-  std::uint64_t seq{}; // arrival sequence number; strictly increasing head -> tail in a level
-  Side side{Side::Buy};
-  OrderType type{OrderType::Limit};
-  OrderNode* prev{nullptr};
-  OrderNode* next{nullptr};
-  Level* level{nullptr};
-};
-
-struct Level {
-  Price price{};
-  Quantity total{0};        // sum of open quantity of the orders below
-  std::uint32_t count{0};
-  OrderNode* head{nullptr};  // oldest: matched first
-  OrderNode* tail{nullptr};  // newest
-};
 
 // Outcome of one call. For an accepted order, filled + resting + cancelled == quantity sent.
 struct Result {
@@ -92,61 +70,21 @@ struct OrderView {
   friend bool operator==(const OrderView&, const OrderView&) = default;
 };
 
-namespace detail {
-
-struct HigherFirst {
-  constexpr bool operator()(Price a, Price b) const noexcept { return a > b; }
-};
-struct LowerFirst {
-  constexpr bool operator()(Price a, Price b) const noexcept { return a < b; }
-};
-
-// One side of the book: price levels ordered best-first.
-template <typename BestFirst>
-class BookSide {
- public:
-  using Map = std::map<Price, Level, BestFirst>;
-
-  [[nodiscard]] bool empty() const noexcept { return levels_.empty(); }
-  [[nodiscard]] std::size_t size() const noexcept { return levels_.size(); }
-  [[nodiscard]] Level& best() noexcept { return levels_.begin()->second; }
-  [[nodiscard]] const Level& best() const noexcept { return levels_.begin()->second; }
-
-  // Existing level at `price`, or a new empty one. Map nodes never move, so the returned
-  // reference (and Level* kept in order nodes) stays valid until the level is erased.
-  Level& get_or_create(Price price) {
-    auto [it, inserted] = levels_.try_emplace(price);
-    if (inserted) it->second.price = price;
-    return it->second;
-  }
-
-  [[nodiscard]] const Level* find(Price price) const {
-    auto it = levels_.find(price);
-    return it == levels_.end() ? nullptr : &it->second;
-  }
-
-  void erase(Price price) { levels_.erase(price); }
-
-  [[nodiscard]] typename Map::const_iterator begin() const noexcept { return levels_.begin(); }
-  [[nodiscard]] typename Map::const_iterator end() const noexcept { return levels_.end(); }
-
- private:
-  Map levels_;
-};
-
-}  // namespace detail
-
-class OrderBook {
+template <typename Levels>
+class BasicOrderBook {
  public:
   // `listener` may be null (no events). `expected_orders` sizes the pool and id map so a book
-  // holding up to that many resting orders never allocates for them.
-  explicit OrderBook(Listener* listener = nullptr, std::size_t expected_orders = 1 << 16);
+  // holding up to that many resting orders never allocates for them. Prices must be positive
+  // multiples of `tick_size` (an off-grid price is rejected as InvalidPrice); the array store
+  // uses it as its slot width.
+  explicit BasicOrderBook(Listener* listener = nullptr, std::size_t expected_orders = 1 << 16,
+                          std::int64_t tick_size = 1);
 
-  OrderBook(const OrderBook&) = delete;
-  OrderBook& operator=(const OrderBook&) = delete;
-  OrderBook(OrderBook&&) = delete;
-  OrderBook& operator=(OrderBook&&) = delete;
-  ~OrderBook() = default;
+  BasicOrderBook(const BasicOrderBook&) = delete;
+  BasicOrderBook& operator=(const BasicOrderBook&) = delete;
+  BasicOrderBook(BasicOrderBook&&) = delete;
+  BasicOrderBook& operator=(BasicOrderBook&&) = delete;
+  ~BasicOrderBook() = default;
 
   // New order of any type. The price of a Market order is ignored.
   Result submit(const Order& order);
@@ -177,6 +115,7 @@ class OrderBook {
   [[nodiscard]] std::size_t order_count() const noexcept { return index_.size(); }
   [[nodiscard]] std::size_t level_count(Side side) const noexcept;
   [[nodiscard]] Quantity resting_qty(Side side) const noexcept;
+  [[nodiscard]] std::int64_t tick_size() const noexcept { return tick_; }
 
   // Full structural self-check: uncrossed book, level totals and counts, FIFO sequence
   // order, link integrity, index and pool agreement. Returns "" if sound, else the first
@@ -184,8 +123,8 @@ class OrderBook {
   [[nodiscard]] std::string validate() const;
 
  private:
-  using Bids = detail::BookSide<detail::HigherFirst>;
-  using Asks = detail::BookSide<detail::LowerFirst>;
+  using Bids = typename Levels::template Side<detail::HigherFirst>;
+  using Asks = typename Levels::template Side<detail::LowerFirst>;
 
   // Calls f(bids_) or f(asks_). Both instantiations must return the same type.
   template <typename F>
@@ -222,12 +161,23 @@ class OrderBook {
   }
   Result reject(OrderId id, Side side, Price price, Reason reason, Timestamp ts) const;
 
+  [[nodiscard]] bool valid_price(Side side, Price p) const noexcept {
+    return on_side(side, [&](const auto& s) { return s.accepts(p); });
+  }
+
   Listener* listener_;
+  std::int64_t tick_;
   Bids bids_;
   Asks asks_;
   ObjectPool<OrderNode> pool_;
   IdMap<OrderNode> index_;
   std::uint64_t next_seq_{0};
 };
+
+// The two books. Member definitions live in order_book.cpp, instantiated for both.
+using OrderBook = BasicOrderBook<MapLevels>;
+using ArrayOrderBook = BasicOrderBook<ArrayLevels>;
+extern template class BasicOrderBook<MapLevels>;
+extern template class BasicOrderBook<ArrayLevels>;
 
 }  // namespace lob

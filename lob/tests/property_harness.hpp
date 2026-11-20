@@ -457,6 +457,8 @@ inline std::optional<Violation> check_call(const Call& c, const BookState& befor
 
 // The real engine plus a subscriber that rebuilds per-order open quantity from exec reports
 // and the L2 book from level updates, and checks both against the book after every call.
+// `Book` is OrderBook (map levels) or ArrayOrderBook (tick-indexed array levels).
+template <typename Book = OrderBook>
 class EngineUnderTest {
  public:
   Outcome submit(const Order& o) {
@@ -529,7 +531,7 @@ class EngineUnderTest {
   }
 
   EventLog log_;
-  OrderBook book_{&log_, 64};  // small: the pool and index must grow during long flows
+  Book book_{&log_, 64};  // small: the pool and index must grow during long flows
   std::unordered_map<OrderId, Quantity> open_;
   std::map<std::pair<int, std::int64_t>, std::pair<Quantity, std::uint32_t>> l2_;
 };
@@ -575,10 +577,11 @@ inline FlowResult run_properties(const std::vector<Op>& ops, Mutation m) {
 }
 
 // Engine and reference in lockstep: results, trades and full L3 state must be identical.
-inline FlowResult run_differential(const std::vector<Op>& ops, Mutation m = Mutation::None) {
+template <typename Book = OrderBook>
+FlowResult run_differential(const std::vector<Op>& ops, Mutation m = Mutation::None) {
   FlowResult fr;
   ReferenceBook ref(m);
-  EngineUnderTest eng;
+  EngineUnderTest<Book> eng;
   for (std::size_t i = 0; i < ops.size(); ++i) {
     const Call c = resolve(ops[i], ref.state(), static_cast<Timestamp>(i));
     const Outcome a = apply(ref, c);

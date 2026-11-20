@@ -1,6 +1,8 @@
 #include "lob/lobster.hpp"
 
+#include <algorithm>
 #include <charconv>
+#include <chrono>
 #include <limits>
 #include <regex>
 #include <sstream>
@@ -176,10 +178,26 @@ bool DayReader::next(Message& m, Snapshot& s) {
 
 // ---------------------------------------------------------------- replay
 
-Replay::Replay(std::size_t levels)
-    : levels_(levels), book_(&tap_, 1 << 16), next_anon_(kAnonBase), next_taker_(kTakerBase) {}
+template <typename Book>
+BasicReplay<Book>::BasicReplay(std::size_t levels, std::int64_t tick)
+    : levels_(levels), book_(&tap_, 1 << 16, tick), next_anon_(kAnonBase), next_taker_(kTakerBase) {
+  tap_.trades.reserve(64);  // so the replay's own listener never allocates inside a call
+}
 
-void Replay::fail(std::string what) {
+template <typename Book>
+template <typename F>
+void BasicReplay<Book>::timed(CallObserver::Kind kind, F&& f) {
+  if (obs_ == nullptr) {
+    f();
+    return;
+  }
+  obs_->begin(kind);
+  f();
+  obs_->end(kind);
+}
+
+template <typename Book>
+void BasicReplay<Book>::fail(std::string what) {
   if (clean_) {
     ++st_.errors;
     if (st_.first_error == 0) {
@@ -190,7 +208,8 @@ void Replay::fail(std::string what) {
   clean_ = false;
 }
 
-std::optional<OrderId> Replay::anon_at(Side s, Price p) {
+template <typename Book>
+std::optional<OrderId> BasicReplay<Book>::anon_at(Side s, Price p) {
   auto& m = anon_[idx(s)];
   const auto it = m.find(p);
   if (it == m.end()) return std::nullopt;
@@ -201,7 +220,8 @@ std::optional<OrderId> Replay::anon_at(Side s, Price p) {
   return it->second;
 }
 
-void Replay::add_anon(Side s, Price p, Quantity q, Timestamp ts) {
+template <typename Book>
+void BasicReplay<Book>::add_anon(Side s, Price p, Quantity q, Timestamp ts) {
   const OrderId id = next_anon_++;
   const Result r = book_.submit(Order{id, s, OrderType::PostOnly, p, q, ts});
   if (!r.accepted) {
@@ -212,12 +232,14 @@ void Replay::add_anon(Side s, Price p, Quantity q, Timestamp ts) {
   anon_[idx(s)][p] = id;
 }
 
-void Replay::clear_level(Side s, Price p, Timestamp ts) {
+template <typename Book>
+void BasicReplay<Book>::clear_level(Side s, Price p, Timestamp ts) {
   for (OrderId id : book_.queue(s, p)) book_.cancel(id, ts);
   anon_[idx(s)].erase(p);
 }
 
-void Replay::reduce(OrderId id, Quantity by, Timestamp ts) {
+template <typename Book>
+void BasicReplay<Book>::reduce(OrderId id, Quantity by, Timestamp ts) {
   const auto o = book_.find(id);
   if (by == o->qty) {
     book_.cancel(id, ts);
@@ -226,13 +248,16 @@ void Replay::reduce(OrderId id, Quantity by, Timestamp ts) {
   }
 }
 
-void Replay::execute(const Message& m, OrderId target) {
+template <typename Book>
+void BasicReplay<Book>::execute(const Message& m, OrderId target) {
   const auto best = book_.best(m.side);
   const std::vector<OrderId> q = book_.queue(m.side, m.price);
   if (best && best->price == m.price && !q.empty() && q.front() == target) {
     tap_.trades.clear();
-    const Result r =
-        book_.submit(Order{next_taker_++, opposite(m.side), OrderType::IOC, m.price, m.size, m.ns});
+    Result r;
+    timed(CallObserver::Match, [&] {
+      r = book_.submit(Order{next_taker_++, opposite(m.side), OrderType::IOC, m.price, m.size, m.ns});
+    });
     if (r.filled != m.size || tap_.trades.size() != 1 || tap_.trades[0].maker != target) {
       fail("matching engine did not fill the executed order exactly");
     } else {
@@ -244,7 +269,8 @@ void Replay::execute(const Message& m, OrderId target) {
   }
 }
 
-void Replay::seed(const Snapshot& s, Timestamp ts) {
+template <typename Book>
+void BasicReplay<Book>::seed(const Snapshot& s, Timestamp ts) {
   for (Side side : {Side::Buy, Side::Sell}) {
     const auto& lv = s.side(side);
     for (const DepthLevel& l : lv) {
@@ -256,14 +282,18 @@ void Replay::seed(const Snapshot& s, Timestamp ts) {
   }
 }
 
-bool Replay::step(const Message& m, const Snapshot& after) {
+template <typename Book>
+bool BasicReplay<Book>::step(const Message& m, const Snapshot& after) {
   ++st_.events;
   ++st_.by_type[static_cast<std::size_t>(m.event)];
   clean_ = true;
 
   switch (m.event) {
     case Event::Submit: {
-      const Result r = book_.submit(Order{m.id, m.side, OrderType::PostOnly, m.price, m.size, m.ns});
+      Result r;
+      timed(CallObserver::Add, [&] {
+        r = book_.submit(Order{m.id, m.side, OrderType::PostOnly, m.price, m.size, m.ns});
+      });
       if (!r.accepted) fail("submission refused: " + std::string(lob::to_string(r.reason)));
       break;
     }
@@ -294,7 +324,8 @@ bool Replay::step(const Message& m, const Snapshot& after) {
       } else if (m.event == Event::ExecuteVisible) {
         execute(m, target);
       } else {
-        reduce(target, m.size, m.ns);
+        timed(m.event == Event::Cancel ? CallObserver::PartialCancel : CallObserver::Delete,
+              [&] { reduce(target, m.size, m.ns); });
       }
       break;
     }
@@ -308,7 +339,8 @@ bool Replay::step(const Message& m, const Snapshot& after) {
   return compare(after) && clean_;
 }
 
-void Replay::sync_revealed(const Snapshot& after, Timestamp ts) {
+template <typename Book>
+void BasicReplay<Book>::sync_revealed(const Snapshot& after, Timestamp ts) {
   for (Side s : {Side::Buy, Side::Sell}) {
     const auto& lv = after.side(s);
     const std::optional<Price> nb =
@@ -338,7 +370,8 @@ void Replay::sync_revealed(const Snapshot& after, Timestamp ts) {
   }
 }
 
-bool Replay::compare(const Snapshot& after) {
+template <typename Book>
+bool BasicReplay<Book>::compare(const Snapshot& after) {
   bool ok = true;
   for (Side s : {Side::Buy, Side::Sell}) {
     const std::vector<LevelView> ours = book_.depth(s, levels_);
@@ -365,5 +398,8 @@ bool Replay::compare(const Snapshot& after) {
   if (!ok) ++st_.mismatches;
   return ok;
 }
+
+template class BasicReplay<OrderBook>;
+template class BasicReplay<ArrayOrderBook>;
 
 }  // namespace lob::lobster

@@ -13,6 +13,7 @@
 #include <fstream>
 #include <sstream>
 #include <string>
+#include <type_traits>
 
 #include "lob/lobster.hpp"
 #include "lob/order_book.hpp"
@@ -190,8 +191,9 @@ std::string partial_fills_keep_place() {
 }
 
 // The five-event LOBSTER day from test_lobster.cpp, replayed with every book event shown.
-template <typename R>
+template <typename Book>
 std::string lobster_day() {
+  using R = lobster::BasicReplay<Book>;
   using lobster::Event;
   using lobster::Message;
   using lobster::Snapshot;
@@ -217,7 +219,7 @@ std::string lobster_day() {
       snap({{Price{5853500}, 40}}, {{Price{5853300}, 100}}),
   };
   TextLog log;
-  R rp(2);
+  R rp(2, 100);  // one-cent grid: every price here is a multiple of 100
   rp.set_listener(&log);
   std::ostringstream out;
   out << "# LOBSTER replay of a five-event day (2 levels)\n"
@@ -234,20 +236,35 @@ std::string lobster_day() {
   return out.str();
 }
 
-TEST(Golden, Ladder) { expect_golden("ladder", ladder<OrderBook>()); }
-TEST(Golden, LimitSweepsAndRests) {
-  expect_golden("limit_sweeps_and_rests", limit_sweeps_and_rests<OrderBook>());
+// Every scenario runs on both level stores against the same golden file: the array book
+// must reproduce the map book's transcripts byte for byte.
+template <typename Book>
+class Golden : public ::testing::Test {};
+using Books = ::testing::Types<OrderBook, ArrayOrderBook>;
+struct BookNames {
+  template <typename T>
+  static std::string GetName(int) {
+    return std::is_same_v<T, OrderBook> ? "MapLevels" : "ArrayLevels";
+  }
+};
+TYPED_TEST_SUITE(Golden, Books, BookNames);
+
+TYPED_TEST(Golden, Ladder) { expect_golden("ladder", ladder<TypeParam>()); }
+TYPED_TEST(Golden, LimitSweepsAndRests) {
+  expect_golden("limit_sweeps_and_rests", limit_sweeps_and_rests<TypeParam>());
 }
-TEST(Golden, MarketAndIoc) { expect_golden("market_and_ioc", market_and_ioc<OrderBook>()); }
-TEST(Golden, FillOrKill) { expect_golden("fill_or_kill", fill_or_kill<OrderBook>()); }
-TEST(Golden, PostOnly) { expect_golden("post_only", post_only<OrderBook>()); }
-TEST(Golden, Cancels) { expect_golden("cancels", cancels<OrderBook>()); }
-TEST(Golden, ModifyPriority) { expect_golden("modify_priority", modify_priority<OrderBook>()); }
-TEST(Golden, Rejections) { expect_golden("rejections", rejections<OrderBook>()); }
-TEST(Golden, PartialFillsKeepPlace) {
-  expect_golden("partial_fills_keep_place", partial_fills_keep_place<OrderBook>());
+TYPED_TEST(Golden, MarketAndIoc) { expect_golden("market_and_ioc", market_and_ioc<TypeParam>()); }
+TYPED_TEST(Golden, FillOrKill) { expect_golden("fill_or_kill", fill_or_kill<TypeParam>()); }
+TYPED_TEST(Golden, PostOnly) { expect_golden("post_only", post_only<TypeParam>()); }
+TYPED_TEST(Golden, Cancels) { expect_golden("cancels", cancels<TypeParam>()); }
+TYPED_TEST(Golden, ModifyPriority) {
+  expect_golden("modify_priority", modify_priority<TypeParam>());
 }
-TEST(Golden, LobsterDay) { expect_golden("lobster_day", lobster_day<lobster::Replay>()); }
+TYPED_TEST(Golden, Rejections) { expect_golden("rejections", rejections<TypeParam>()); }
+TYPED_TEST(Golden, PartialFillsKeepPlace) {
+  expect_golden("partial_fills_keep_place", partial_fills_keep_place<TypeParam>());
+}
+TYPED_TEST(Golden, LobsterDay) { expect_golden("lobster_day", lobster_day<TypeParam>()); }
 
 }  // namespace
 }  // namespace lob

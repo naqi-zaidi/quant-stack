@@ -28,7 +28,10 @@
 //     event is counted, since book state must follow what actually happened.
 //   - Hidden executions (type 5) do not change the visible book and are skipped.
 
+#include <algorithm>
 #include <array>
+#include <chrono>
+#include <limits>
 #include <cstddef>
 #include <cstdint>
 #include <fstream>
@@ -130,9 +133,42 @@ struct ReplayStats {
   std::size_t comparisons{0};           // level comparisons made (price and size each)
 };
 
-class Replay {
+// Hook around every order-book call the replay makes for an event, and only that call:
+// the replay's own bookkeeping (parsing, comparison, level rebuilds) stays outside it.
+// lob_latency times calls with it; lob_alloc_check counts heap allocations inside them.
+class CallObserver {
  public:
-  explicit Replay(std::size_t levels);
+  enum Kind : std::size_t { Add, PartialCancel, Delete, Match, kKinds };
+  CallObserver() = default;
+  CallObserver(const CallObserver&) = delete;
+  CallObserver& operator=(const CallObserver&) = delete;
+  virtual ~CallObserver() = default;
+  virtual void begin(Kind kind) = 0;
+  virtual void end(Kind kind) = 0;
+};
+
+// Engine-call latencies in nanoseconds, one vector per kind of call.
+class LatencyLog final : public CallObserver {
+ public:
+  void begin(Kind) override { t0_ = std::chrono::steady_clock::now(); }
+  void end(Kind kind) override {
+    const auto took = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                          std::chrono::steady_clock::now() - t0_).count();
+    ns[kind].push_back(static_cast<std::uint32_t>(
+        std::min<std::int64_t>(took, std::numeric_limits<std::uint32_t>::max())));
+  }
+  std::array<std::vector<std::uint32_t>, kKinds> ns;
+
+ private:
+  std::chrono::steady_clock::time_point t0_;
+};
+
+template <typename Book>
+class BasicReplay {
+ public:
+  // `tick` is passed to the book: prices must lie on that grid, and the array book uses it
+  // as its slot width (100 = one cent in LOBSTER's units).
+  explicit BasicReplay(std::size_t levels, std::int64_t tick = 1);
 
   // Seeds the book from the snapshot that follows the first message of the day.
   void seed(const Snapshot& s, Timestamp ts = 0);
@@ -142,7 +178,12 @@ class Replay {
   bool step(const Message& m, const Snapshot& after);
 
   [[nodiscard]] const ReplayStats& stats() const noexcept { return st_; }
-  [[nodiscard]] const OrderBook& book() const noexcept { return book_; }
+  [[nodiscard]] const Book& book() const noexcept { return book_; }
+
+  // When set, every engine call made for an event is bracketed by obs->begin/end (null to
+  // stop). set_latency_log is the timing case.
+  void set_call_observer(CallObserver* obs) noexcept { obs_ = obs; }
+  void set_latency_log(LatencyLog* log) noexcept { obs_ = log; }
 
   // Receives every event the book emits during the replay, including the replay's own
   // bookkeeping (seeding, rebuilding levels that scroll into view). Null to stop.
@@ -176,10 +217,13 @@ class Replay {
   void sync_revealed(const Snapshot& after, Timestamp ts);
   bool compare(const Snapshot& after);
   void fail(std::string what);
+  template <typename F>
+  void timed(CallObserver::Kind kind, F&& f);
 
   std::size_t levels_;
   TradeTap tap_;
-  OrderBook book_;
+  Book book_;
+  CallObserver* obs_{nullptr};
   std::map<Price, OrderId> anon_[2];
   std::optional<Price> boundary_[2];  // deepest visible price; nullopt = whole side visible
   OrderId next_anon_;
@@ -187,5 +231,10 @@ class Replay {
   ReplayStats st_;
   bool clean_{true};  // current event applied without error
 };
+
+using Replay = BasicReplay<OrderBook>;
+using ArrayReplay = BasicReplay<ArrayOrderBook>;
+extern template class BasicReplay<OrderBook>;
+extern template class BasicReplay<ArrayOrderBook>;
 
 }  // namespace lob::lobster

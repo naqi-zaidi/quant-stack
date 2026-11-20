@@ -8,6 +8,7 @@
 **One market-making research system rather than three separate demos.** A Monte Carlo engine simulates a hidden fair value. Agents send orders around it into a C++20 limit order book. A market maker quotes into that book through a risk layer, and analytics score the result.
 
 > **Status:** Foundation done. **Project 1 (Monte Carlo engine) is complete.** **Phase 2, the C++20 limit order book, is under way.**
+> - **Project 2, step 4 (benchmarks):** a tick-indexed array of price levels makes the steady-state hot path allocation-free, closes a level 4.0× faster than an ordered map (31 vs 122 ns) and opens one 1.6× faster. On real AAPL flow, a delete takes about 40% less time at the median. It reproduces every golden transcript and pinned digest from step 3.5 byte for byte.
 > - **Project 2, step 3.5 (snapshot tests, pinned digests):** ten golden-file scenarios print the whole book and every event, and the event stream's FNV-1a digest is pinned for 18 fixed flows. Both are fixed before the level structure changes in step 4, which must reproduce them byte for byte.
 > - **Project 2, step 3 (LOBSTER replay):** the engine rebuilt Nasdaq's AAPL book for 2012-06-21 and matched LOBSTER's 10-level book after all 400,390 events, with zero mismatches. 99.89% of Nasdaq's visible executions were reproduced by the engine's own matcher.
 > - **Project 2, step 2 (property tests):** 400,000 random calls with zero property violations, and the engine matches a naive reference model on every call. Twelve planted bugs are all caught, each shrunk to a counterexample of 1–3 calls.
@@ -24,6 +25,69 @@
 > CI runs a gate for every step.
 
 ## Results so far
+
+### Limit order book: benchmarks, map vs array price levels (Project 2, step 4)
+
+**A tick-indexed array of price levels makes the steady-state hot path allocation-free, closes a level 4.0× faster than an ordered map and opens one 1.6× faster. Cancels, matches and size changes cost the same on both, within noise.** On Nasdaq's real AAPL order flow, a delete takes about 40% less time at the median (60 vs 103 ns). Adds and matches land within each other's run-to-run ranges.
+
+**The two books.** The engine code is shared; only the price-level store differs ([`levels.hpp`](lob/include/lob/levels.hpp)).
+- `OrderBook` keeps a `std::map` from price to level. It accepts any price, but every new level is a heap node, and finding one takes O(log L).
+- `ArrayOrderBook` gives every tick its own slot (price ÷ tick).
+  - Slots live in 4,096-slot pages that never move, so orders can keep raw pointers to their level.
+  - An occupancy bitmap finds the next best price after the best level empties, checking 64 slots per instruction.
+  - Prices must sit on the tick grid, within a span of 2²⁶ ticks. AAPL's whole day at one-cent ticks fits in 1,100 slots, a single page.
+
+**Same behaviour, byte for byte.** The array book reproduces the step 3.5 safety net, recorded on the map book before the levels changed, without regenerating anything:
+- all 10 golden transcripts;
+- all 18 pinned event-stream digests;
+- the real AAPL replay's digest, `0x089e41b222534921` over 1,283,305 book events.
+
+It also passes everything else the map book does: the 400,000-call property suite with zero violations, the reference-model comparison with zero mismatches, 200,000 random level operations checked against the map store, and the AAPL replay with zero mismatches (`lob_replay <file> --array`).
+
+**Heap allocations on the hot path (the step 4 CI gate).** `lob_alloc_check` replaces the global `operator new`/`delete` and counts only while an engine call is running, after a warm-up:
+
+| Workload | Book | Engine calls | Allocations | Frees | Levels opened / closed |
+|---|---|---:|---:|---:|---:|
+| 5 regimes × 8 fixed-seed flows × 2,000 calls | map | 80,000 | 3,038 | 2,992 | 3,038 / 2,992 |
+| | **array** | 80,000 | **0** | **0** | 3,038 / 2,992 |
+| Real AAPL day, every engine call | map | 389,033 | 106,380 | 104,562 | 106,380 / 104,562 |
+| | **array** | 389,033 | **0** | **0** | 106,380 / 104,562 |
+
+- **The gate:** the array book allocates nothing, and the map book allocates exactly one `std::map` node per level opened and frees one per level closed.
+- **Why it's the gate:** counts are deterministic, unlike latency on shared CI runners, so CI runs this check (synthetic flows; the AAPL row needs the sample locally). A deliberately planted throwaway allocation in `submit` fails it on both books.
+- **What the real flow shows:** on Nasdaq's real flow, 27% of engine calls open a price level, which is where the map pays.
+
+**Microbenchmarks** (Google Benchmark; mean ± standard deviation over 10 repetitions; ns per operation):
+
+| Operation | Map | Array | Map ÷ array |
+|---|---:|---:|---:|
+| Close a level (cancel its only order) | 122.4 ± 7.5 | 30.8 ± 1.4 | 3.97 |
+| Open a level (add at a new price) | 68.9 ± 5.5 | 42.0 ± 4.8 | 1.64 |
+| Add at an existing level | 58.2 ± 2.8 | 43.5 ± 5.0 | 1.34 |
+| Reduce size in place | 10.5 ± 0.5 | 9.4 ± 0.3 | 1.11 |
+| Cancel from inside a queue | 24.0 ± 0.5 | 25.3 ± 1.9 | 0.95 |
+| Match one order (IOC) | 31.5 ± 1.8 | 33.9 ± 1.7 | 0.93 |
+| Sweep 5 levels (100 fills, 5 levels closed) | 1,560 ± 101 | 1,542 ± 37 | 1.01 |
+
+**How they were run.**
+- **Book:** 50 levels a side around a $580 mid on a one-cent grid, 20 orders per level.
+- **Batches:** each timed batch is 1,024 operations of one kind; setup and cleanup run with the timer paused. No listener is attached.
+- **Machine:** GCC 13 at `-O3` on a shared cloud VM (2 vCPUs, Intel Xeon at 2.1 GHz).
+
+**What the benchmarks changed.** An early run had the array book slower at matching. Its price check did two 64-bit integer divisions per order, against the map's one, and 64-bit division is slow on this CPU. Checking the range against price limits, updated as pages are added, removed the second division and brought matching level.
+
+**Latency on Nasdaq's real message mix.** The microbenchmarks above use synthetic flows. `lob_latency` replays the actual AAPL message stream on both books and times every engine call; each figure is the median of 5 runs, in ns:
+
+| Call | Calls | p50 map / array | p99 map / array | p99.9 map / array |
+|---|---:|---:|---:|---:|
+| Add | 191,014 | 178 / 170 | 458 / 443 | 682 / 626 |
+| Partial cancel | 3,260 | 57 / 57 | 131 / 130 | 239 / 228 |
+| Delete | 171,126 | **103 / 60** | 278 / 250 | 459 / 439 |
+| Match (IOC fills the executed order) | 23,633 | 186 / 182 | 477 / 457 | 748 / 647 |
+
+Only the delete gap is wider than the run-to-run spread: p50 ranged 101–105 ns on the map and 55–63 ns on the array. Every figure includes about 26 ns for reading the clock. These calls cost more than the microbenchmarks, and the setups differ in several ways: the replay times through a clock read, attaches a listener and uses real Nasdaq order ids, and it parses CSV and compares books between engine calls, where a microbenchmark repeats one operation in a tight loop. The whole day replays in about 0.51 s on either book (780,000 events per second), with CSV parsing dominating.
+
+To reproduce, run `./build/release/lob/tests/lob_alloc_check [AAPL message file]` and `./build/release/lob/lob_bench --benchmark_repetitions=10`. Add `./build/release/lob/lob_latency data/AAPL_2012-06-21_34200000_57600000_message_10.csv` if you have the LOBSTER sample. Latency depends on the machine, so CI gates on allocation counts and only checks that the benchmarks build and run.
 
 ### Limit order book: snapshot tests and pinned event digests (Project 2, step 3.5)
 
@@ -469,7 +533,7 @@ flowchart TB
 |---|---|---|---|
 | 0 · Foundation | Monorepo, CMake + uv, CI with ASan/UBSan, LOBSTER loader | CI green | ✅ done |
 | 1 · Monte Carlo engine | Pricer with error bars ✅ → variance reduction ✅ → Greeks ✅ → Asian/barrier/American (Longstaff–Schwartz) ✅ → Merton + Heston ✅ → SPY calibration ✅ → Numba ✅ | MC within its standard error of Black–Scholes | ✅ done |
-| 2 · Limit order book | Matching engine ✅ → property tests ✅ → LOBSTER replay ✅ → snapshot tests + pinned digests ✅ → benchmarks → pybind11 → microstructure analytics | Rebuilt book matches LOBSTER on every event ✅ (AAPL: 400,390 events, 0 mismatches) | 🔨 in progress |
+| 2 · Limit order book | Matching engine ✅ → property tests ✅ → LOBSTER replay ✅ → snapshot tests + pinned digests ✅ → benchmarks ✅ → pybind11 → microstructure analytics | Rebuilt book matches LOBSTER on every event ✅ (AAPL: 400,390 events, 0 mismatches) | 🔨 in progress |
 | 3 · Market maker | Avellaneda–Stoikov, order-flow-imbalance skew, markouts, risk overlay | Walk-forward, out-of-sample, net of fees | ⏳ |
 | 4 · Add-ons | Delta-hedging PnL simulator, Almgren–Chriss execution on the book | — | ⏳ |
 
@@ -502,6 +566,9 @@ ctest --preset asan
 cmake --preset release && cmake --build --preset release
 ./build/release/lob/tests/lob_property_report   # step 2 tables: 400k calls, planted bugs (~12 s)
 ./build/release/lob/lob_replay data/AAPL_2012-06-21_34200000_57600000_message_10.csv  # step 3 gate (~5 s)
+./build/release/lob/tests/lob_alloc_check                                              # step 4 gate (~6 s)
+./build/release/lob/lob_bench --benchmark_repetitions=10                                # step 4 (~6 min)
+./build/release/lob/lob_latency data/AAPL_2012-06-21_34200000_57600000_message_10.csv  # step 4 (~15 s)
 
 # Accept an intended change to the snapshot tests, then review the diff before committing:
 UPDATE_GOLDEN=1 ./build/release/lob/tests/lob_tests --gtest_filter='Golden*'
@@ -581,11 +648,13 @@ quant-stack/
                       Merton jump-diffusion, Heston (semi-analytic, Euler, QE), implied vol,
                       fast Heston surface pricer + calibration, Numba kernels (fast.py)
     experiments/      scripts that produce every number in this README
-  lob/                Project 2: C++20 matching engine (order_book), id map, object pool,
-                      event stream, LOBSTER reader and replay (lobster)
-    tools/            lob_replay: the step 3 gate on a real LOBSTER day
+  lob/                Project 2: C++20 matching engine (order_book) over map or array price
+                      levels (levels), id map, object pool, event stream, LOBSTER replay
+    tools/            lob_replay (step 3 gate), lob_latency (step 4, real-flow latency)
+    bench/            lob_bench: Google Benchmark microbenchmarks, map vs array
     tests/            GoogleTest suite, reference model, property harness + shrinker,
-                      lob_property_report (step 2 gate), pinned event digests
+                      lob_property_report (step 2 gate), pinned event digests,
+                      lob_alloc_check (step 4 gate)
       golden/         snapshot-test transcripts (step 3.5)
   marketdata/         loaders: LOBSTER, option-chain snapshots → implied-vol surface
   tests/              pytest + Hypothesis property tests
@@ -611,7 +680,8 @@ quant-stack/
 - SPY options are American; the calibration treats them as European. Using out-of-the-money quotes only keeps the early-exercise premium small, but doesn't remove it.
 - One snapshot, flat discounting at 3.9%. Forwards come from parity, so the dividend yield is never needed. A term structure of rates would barely move the vols.
 - Heston can't produce the steep 2-week skew. Adding jumps (Bates) is the natural next model.
-- Order book: opening a new price level allocates a map node, so "no allocation on the hot path" holds only for orders, not levels. Step 4's tick-indexed array removes that.
+- Order book: on the map book, opening a price level allocates a map node. The array book allocates only when a price first lands in a new 4,096-tick page, but it needs prices on a fixed tick grid within a bounded span.
+- Benchmarks: measured on a shared 2-vCPU cloud VM, so absolute numbers are noisy and machine-specific; the repetitions and run-to-run ranges are there for that reason. Real-flow latencies include about 26 ns of clock overhead.
 - Order book: single-threaded, no self-trade prevention, no hidden or iceberg orders. Post-only orders are rejected rather than re-priced when they would cross.
 - LOBSTER replay: validated on one stock-day. More LOBSTER sample days (MSFT, for example) would broaden it. The real-data gate runs locally, not in CI, because the sample can't be redistributed.
 - Order book tests: the reference model and the engine share an author, so a misreading of the matching rules common to both would pass the comparison. The planted bugs show the checks can catch errors; they don't prove the rules match an exchange's. Step 3's replay against real Nasdaq data is that outside check.

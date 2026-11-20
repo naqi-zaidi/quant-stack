@@ -2,6 +2,10 @@
 // rebuilt book with LOBSTER's after every event.
 //
 //   lob_replay data/AAPL_2012-06-21_34200000_57600000_message_10.csv [drop_checks=12]
+//              [--array [--tick 100]]
+//
+// --array replays on the tick-indexed array book (tick in LOBSTER units; 100 = one cent)
+// instead of the ordered-map book.
 //
 // Prints a markdown report. Exits non-zero unless every event applies cleanly, every visible
 // level matches after every event, and every drop-one-message trial is detected. A trial
@@ -36,16 +40,22 @@ struct Run {
   double seconds{0};
 };
 
+struct Options {
+  bool array{false};
+  std::int64_t tick{1};
+};
+
 // Replays the day. `drop` (1-based event number, 0 = none) replaces that message with a no-op
 // while still comparing against its snapshot. `stop_early` ends at the first problem.
-Run replay(const std::string& msg_path, const FileInfo& info, std::size_t drop, bool stop_early,
-           bool keep_types) {
+template <typename R>
+Run replay_on(const std::string& msg_path, const FileInfo& info, const Options& opt,
+              std::size_t drop, bool stop_early, bool keep_types) {
   const auto t0 = std::chrono::steady_clock::now();
   DayReader rd(msg_path, info.orderbook_path, info.levels);
   Message m;
   Snapshot s;
   if (!rd.next(m, s)) throw std::runtime_error("empty file");
-  Replay rp(info.levels);
+  R rp(info.levels, opt.tick);
   EventDigest dg;
   rp.set_listener(&dg);
   rp.seed(s, m.ns);
@@ -63,6 +73,12 @@ Run replay(const std::string& msg_path, const FileInfo& info, std::size_t drop, 
   run.digest_events = dg.events();
   run.seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
   return run;
+}
+
+Run replay(const std::string& msg_path, const FileInfo& info, const Options& opt,
+           std::size_t drop, bool stop_early, bool keep_types) {
+  return opt.array ? replay_on<ArrayReplay>(msg_path, info, opt, drop, stop_early, keep_types)
+                   : replay_on<Replay>(msg_path, info, opt, drop, stop_early, keep_types);
 }
 
 std::string pct(std::size_t a, std::size_t b) {
@@ -83,19 +99,35 @@ std::uint64_t mix(std::uint64_t& s) {
 
 int main(int argc, char** argv) try {
   if (argc < 2) {
-    std::cerr << "usage: lob_replay <TICKER_DATE_START_END_message_LEVELS.csv> [drop_checks=12]\n";
+    std::cerr << "usage: lob_replay <TICKER_DATE_START_END_message_LEVELS.csv> [drop_checks=12]"
+                 " [--array [--tick 100]]\n";
     return 2;
   }
   const std::string msg_path = argv[1];
-  const std::size_t trials = argc > 2 ? std::stoul(argv[2]) : 12;
+  std::size_t trials = 12;
+  Options opt;
+  bool tick_given = false;
+  for (int i = 2; i < argc; ++i) {
+    const std::string a = argv[i];
+    if (a == "--array") {
+      opt.array = true;
+    } else if (a == "--tick" && i + 1 < argc) {
+      opt.tick = std::stoll(argv[++i]);
+      tick_given = true;
+    } else {
+      trials = std::stoul(a);
+    }
+  }
+  if (opt.array && !tick_given) opt.tick = 100;  // one cent: Nasdaq's tick above $1
   const FileInfo info = describe_file(msg_path);
 
-  const Run main_run = replay(msg_path, info, 0, false, true);
+  const Run main_run = replay(msg_path, info, opt, 0, false, true);
   const ReplayStats& st = main_run.stats;
   bool ok = st.mismatches == 0 && st.errors == 0;
 
   std::cout << "## LOBSTER replay: " << info.ticker << " " << info.date << ", " << info.levels
-            << " levels\n\n"
+            << " levels, " << (opt.array ? "array" : "map") << " book, tick " << opt.tick
+            << "\n\n"
             << "| Measure | Value |\n|---|---:|\n"
             << "| Events replayed (after the seeding snapshot) | " << st.events << " |\n";
   for (int t = 1; t <= 7; ++t) {
@@ -146,7 +178,7 @@ int main(int argc, char** argv) try {
     const auto& pool = by_type[1 + t % 4];  // submit, partial cancel, delete, visible execution
     if (pool.empty()) continue;
     const std::size_t k = pool[mix(seed) % pool.size()];
-    const Run r = replay(msg_path, info, k, true, false);
+    const Run r = replay(msg_path, info, opt, k, true, false);
     const std::size_t first = std::min(r.stats.first_mismatch == 0 ? SIZE_MAX : r.stats.first_mismatch,
                                        r.stats.first_error == 0 ? SIZE_MAX : r.stats.first_error);
     const bool hit = first == k;

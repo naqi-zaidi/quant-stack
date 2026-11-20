@@ -9,6 +9,7 @@
 #include <gtest/gtest.h>
 
 #include <string>
+#include <type_traits>
 #include <vector>
 
 #include "property_harness.hpp"
@@ -23,39 +24,52 @@ constexpr std::size_t kCallsPerFlow = 1000;
 constexpr std::size_t kHuntCalls = 2000;
 
 // On failure: the shrunk counterexample, replayed call by call on the engine.
+template <typename Book>
 std::string engine_counterexample(std::vector<Op> ops, const FlowResult& fr) {
   ops.resize(fr.step + 1);
   const std::string prop = fr.violation->property;
   ops = shrink(ops, [&](const std::vector<Op>& o) {
-    EngineUnderTest e;
+    EngineUnderTest<Book> e;
     const FlowResult r = run_properties(o, e);
     return r.violation && r.violation->property == prop;
   });
-  EngineUnderTest e;
+  EngineUnderTest<Book> e;
   return "minimal counterexample:\n" + describe(ops, e);
 }
 
-TEST(Properties, EngineHoldsEveryPropertyOnEveryCall) {
+// Both level stores (ordered map, tick-indexed array) face the same suite.
+template <typename Book>
+class EngineProperties : public ::testing::Test {};
+using Books = ::testing::Types<OrderBook, ArrayOrderBook>;
+struct BookNames {
+  template <typename T>
+  static std::string GetName(int) {
+    return std::is_same_v<T, OrderBook> ? "MapLevels" : "ArrayLevels";
+  }
+};
+TYPED_TEST_SUITE(EngineProperties, Books, BookNames);
+
+TYPED_TEST(EngineProperties, HoldsEveryPropertyOnEveryCall) {
   for (const Regime& rg : kRegimes) {
     for (std::uint64_t seed = 1; seed <= kSeedsPerRegime; ++seed) {
       const std::vector<Op> ops = generate_flow(rg, seed, kCallsPerFlow);
-      EngineUnderTest eng;
+      EngineUnderTest<TypeParam> eng;
       const FlowResult fr = run_properties(ops, eng);
       ASSERT_FALSE(fr.violation) << rg.name << ", seed " << seed << ", call " << fr.step + 1
                                  << ": " << fr.violation->property << ": "
                                  << fr.violation->detail << "\n"
-                                 << engine_counterexample(ops, fr);
+                                 << engine_counterexample<TypeParam>(ops, fr);
       EXPECT_EQ(fr.calls, kCallsPerFlow);
       EXPECT_GT(fr.trades, kCallsPerFlow / 50) << rg.name << ": flow should trade";
     }
   }
 }
 
-TEST(Properties, EngineMatchesTheReferenceModelCallForCall) {
+TYPED_TEST(EngineProperties, MatchesTheReferenceModelCallForCall) {
   for (const Regime& rg : kRegimes) {
     for (std::uint64_t seed = 1; seed <= kSeedsPerRegime; ++seed) {
       const std::vector<Op> ops = generate_flow(rg, seed, kCallsPerFlow);
-      const FlowResult fr = run_differential(ops);
+      const FlowResult fr = run_differential<TypeParam>(ops);
       ASSERT_FALSE(fr.violation) << rg.name << ", seed " << seed << ", call " << fr.step + 1
                                  << ": " << fr.violation->detail;
     }

@@ -7,6 +7,7 @@
 #include <fstream>
 #include <initializer_list>
 #include <string>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -105,7 +106,10 @@ struct Day {
 // Attaches an event-stream digest to a replay and checks it against its pin when the test
 // ends. Seeding and level rebuilds are part of the stream.
 struct PinGuard {
-  PinGuard(Replay& rp, std::string pin_name) : name(std::move(pin_name)) { rp.set_listener(&dg); }
+  template <typename R>
+  PinGuard(R& rp, std::string pin_name) : name(std::move(pin_name)) {
+    rp.set_listener(&dg);
+  }
   PinGuard(const PinGuard&) = delete;
   PinGuard& operator=(const PinGuard&) = delete;
   ~PinGuard() { testing_helpers::expect_pinned(name, dg); }
@@ -113,16 +117,30 @@ struct PinGuard {
   std::string name;
 };
 
+template <typename R>
 ReplayStats run(const Day& d, const std::string& pin_name, std::size_t levels = 2) {
-  Replay rp(levels);
+  R rp(levels);
   PinGuard pin(rp, pin_name);
   rp.seed(d.books[0]);
   for (std::size_t i = 1; i < d.msgs.size(); ++i) rp.step(d.msgs[i], d.books[i]);
   return rp.stats();
 }
 
-TEST(LobsterReplay, ConsistentDayMatchesOnEveryEvent) {
-  const ReplayStats st = run(Day{}, "lobster/consistent_day");
+// The hand-built replays run on both books. Each pins its event-stream digest, recorded on
+// the map book at step 3.5: the array book must reproduce it byte for byte.
+template <typename R>
+class LobsterReplay : public ::testing::Test {};
+using Replays = ::testing::Types<Replay, ArrayReplay>;
+struct ReplayNames {
+  template <typename T>
+  static std::string GetName(int) {
+    return std::is_same_v<T, Replay> ? "MapLevels" : "ArrayLevels";
+  }
+};
+TYPED_TEST_SUITE(LobsterReplay, Replays, ReplayNames);
+
+TYPED_TEST(LobsterReplay, ConsistentDayMatchesOnEveryEvent) {
+  const ReplayStats st = run<TypeParam>(Day{}, "lobster/consistent_day");
   EXPECT_EQ(st.events, 4u);
   EXPECT_EQ(st.mismatches, 0u) << st.first_mismatch_detail;
   EXPECT_EQ(st.errors, 0u) << st.first_error_detail;
@@ -131,23 +149,45 @@ TEST(LobsterReplay, ConsistentDayMatchesOnEveryEvent) {
   EXPECT_EQ(st.comparisons, 4u * 2u * 2u);
 }
 
-TEST(LobsterReplay, CorruptedSnapshotIsCaughtAtThatEvent) {
+TEST(LobsterReplayTools, ArrayBookReplaysTheSameDayAtOneCentTicks) {
+  const Day d;
+  ArrayReplay rp(2, 100);  // one-cent slots
+  rp.seed(d.books[0]);
+  for (std::size_t i = 1; i < d.msgs.size(); ++i) EXPECT_TRUE(rp.step(d.msgs[i], d.books[i]));
+  EXPECT_EQ(rp.stats().mismatches, 0u);
+  EXPECT_EQ(rp.stats().executions_matched, 1u);
+}
+
+TEST(LobsterReplayTools, LatencyLogTimesEachEngineCall) {
+  const Day d;
+  Replay rp(2);
+  LatencyLog log;
+  rp.set_latency_log(&log);
+  rp.seed(d.books[0]);
+  for (std::size_t i = 1; i < d.msgs.size(); ++i) rp.step(d.msgs[i], d.books[i]);
+  EXPECT_EQ(log.ns[LatencyLog::Add].size(), 2u);
+  EXPECT_EQ(log.ns[LatencyLog::Match].size(), 1u);
+  EXPECT_EQ(log.ns[LatencyLog::Delete].size(), 1u);
+  EXPECT_TRUE(log.ns[LatencyLog::PartialCancel].empty());
+}
+
+TYPED_TEST(LobsterReplay, CorruptedSnapshotIsCaughtAtThatEvent) {
   Day d;
   d.books[3].asks[0].qty = 41;  // LOBSTER says 40 after the execution
-  const ReplayStats st = run(d, "lobster/corrupted_snapshot");
+  const ReplayStats st = run<TypeParam>(d, "lobster/corrupted_snapshot");
   EXPECT_EQ(st.first_mismatch, 3u);
   EXPECT_NE(st.first_mismatch_detail.find("Sell level 1"), std::string::npos);
 }
 
-TEST(LobsterReplay, MissingMessageIsCaughtAtThatEvent) {
+TYPED_TEST(LobsterReplay, MissingMessageIsCaughtAtThatEvent) {
   Day d;
   d.msgs[2].event = Event::Halt;  // drop "buy 20 @ 585.32"
-  const ReplayStats st = run(d, "lobster/missing_message");
+  const ReplayStats st = run<TypeParam>(d, "lobster/missing_message");
   EXPECT_EQ(st.first_mismatch, 2u);
 }
 
-TEST(LobsterReplay, PreOpenOrdersDrawOnSeededLiquidity) {
-  Replay rp(2);
+TYPED_TEST(LobsterReplay, PreOpenOrdersDrawOnSeededLiquidity) {
+  TypeParam rp(2);
   PinGuard pin(rp, "lobster/pre_open_orders");
   rp.seed(snap({}, {lv(1000, 100)}));
   // Order 999 rested before the open, so the file never submitted it.
@@ -159,8 +199,8 @@ TEST(LobsterReplay, PreOpenOrdersDrawOnSeededLiquidity) {
   EXPECT_EQ(rp.book().order_count(), 0u);
 }
 
-TEST(LobsterReplay, ExecutionOfAnOrderNotFirstInQueueIsCountedAndFollowed) {
-  Replay rp(2);
+TYPED_TEST(LobsterReplay, ExecutionOfAnOrderNotFirstInQueueIsCountedAndFollowed) {
+  TypeParam rp(2);
   PinGuard pin(rp, "lobster/out_of_order_execution");
   rp.seed(snap({}, {}));
   rp.step(msg(Event::Submit, 1, 10, 2000, -1), snap({lv(2000, 10)}, {}));
@@ -173,8 +213,8 @@ TEST(LobsterReplay, ExecutionOfAnOrderNotFirstInQueueIsCountedAndFollowed) {
   EXPECT_FALSE(rp.book().find(2));
 }
 
-TEST(LobsterReplay, LevelScrollingIntoViewIsRebuiltFromTheSnapshot) {
-  Replay rp(2);
+TYPED_TEST(LobsterReplay, LevelScrollingIntoViewIsRebuiltFromTheSnapshot) {
+  TypeParam rp(2);
   PinGuard pin(rp, "lobster/level_scrolls_into_view");
   rp.seed(snap({lv(101, 10), lv(102, 20)}, {}));  // two levels shown: more may lie beyond
   // The best ask goes; 103 scrolls into view with 30 the replay has never seen.
@@ -187,8 +227,8 @@ TEST(LobsterReplay, LevelScrollingIntoViewIsRebuiltFromTheSnapshot) {
   EXPECT_EQ(rp.stats().errors, 0u) << rp.stats().first_error_detail;
 }
 
-TEST(LobsterReplay, StaleOutOfViewLevelIsReplacedWhenItReturns) {
-  Replay rp(1);
+TYPED_TEST(LobsterReplay, StaleOutOfViewLevelIsReplacedWhenItReturns) {
+  TypeParam rp(1);
   PinGuard pin(rp, "lobster/stale_level_returns");
   rp.seed(snap({lv(102, 7)}, {}));
   rp.step(msg(Event::Submit, 1, 10, 101, -1), snap({lv(101, 10)}, {}));  // 102 drops out of view
@@ -199,8 +239,8 @@ TEST(LobsterReplay, StaleOutOfViewLevelIsReplacedWhenItReturns) {
   EXPECT_EQ(rp.stats().mismatches, 0u);
 }
 
-TEST(LobsterReplay, AlreadyVisibleLevelsAreNeverResynced) {
-  Replay rp(2);
+TYPED_TEST(LobsterReplay, AlreadyVisibleLevelsAreNeverResynced) {
+  TypeParam rp(2);
   PinGuard pin(rp, "lobster/already_visible_level");
   rp.seed(snap({lv(101, 10), lv(102, 20)}, {}));
   // The snapshot claims 102 changed, but 102 was visible and no message touched it: that is
@@ -210,23 +250,23 @@ TEST(LobsterReplay, AlreadyVisibleLevelsAreNeverResynced) {
   EXPECT_EQ(rp.stats().first_mismatch, 1u);
 }
 
-TEST(LobsterReplay, InconsistentEventsAreErrors) {
+TYPED_TEST(LobsterReplay, InconsistentEventsAreErrors) {
   {
-    Replay rp(2);
+    TypeParam rp(2);
     PinGuard pin(rp, "lobster/error_crossing_submission");
     rp.seed(snap({lv(101, 10)}, {}));
     EXPECT_FALSE(rp.step(msg(Event::Submit, 1, 5, 101, 1), snap({lv(101, 10)}, {lv(101, 5)})));
     EXPECT_NE(rp.stats().first_error_detail.find("WouldCross"), std::string::npos);
   }
   {
-    Replay rp(2);
+    TypeParam rp(2);
     PinGuard pin(rp, "lobster/error_unknown_order");
     rp.seed(snap({lv(101, 10)}, {}));
     EXPECT_FALSE(rp.step(msg(Event::Delete, 7, 5, 105, -1), snap({lv(101, 10)}, {})));
     EXPECT_NE(rp.stats().first_error_detail.find("unknown"), std::string::npos);
   }
   {
-    Replay rp(2);
+    TypeParam rp(2);
     PinGuard pin(rp, "lobster/error_delete_size");
     rp.seed(snap({}, {}));
     rp.step(msg(Event::Submit, 1, 10, 101, -1), snap({lv(101, 10)}, {}));
@@ -234,7 +274,7 @@ TEST(LobsterReplay, InconsistentEventsAreErrors) {
     EXPECT_NE(rp.stats().first_error_detail.find("differs"), std::string::npos);
   }
   {
-    Replay rp(2);
+    TypeParam rp(2);
     PinGuard pin(rp, "lobster/error_oversize_execution");
     rp.seed(snap({}, {}));
     rp.step(msg(Event::Submit, 1, 10, 101, -1), snap({lv(101, 10)}, {}));

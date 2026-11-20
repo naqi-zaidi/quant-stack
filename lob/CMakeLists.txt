@@ -10,6 +10,16 @@ set_target_properties(lob_core PROPERTIES POSITION_INDEPENDENT_CODE ON)
 add_executable(lob_replay tools/lob_replay.cpp)
 target_link_libraries(lob_replay PRIVATE lob::core qs_options)
 
+# Step 4: engine-call latency percentiles on the same real day, map vs array levels.
+add_executable(lob_latency tools/lob_latency.cpp)
+target_link_libraries(lob_latency PRIVATE lob::core qs_options)
+
 if(QS_BUILD_TESTS)
   add_subdirectory(tests)
+endif()
+
+# Step 4: Google Benchmark microbenchmarks (cmake -DQS_BUILD_BENCHMARKS=ON; on in `release`).
+if(QS_BUILD_BENCHMARKS)
+  add_executable(lob_bench bench/bench_book.cpp)
+  target_link_libraries(lob_bench PRIVATE lob::core qs_options benchmark::benchmark)
 endif()

@@ -66,9 +66,16 @@ EventDigest digest_flow(const Regime& rg, std::uint64_t seed) {
   return dg;
 }
 
-TEST(PinnedDigests, PropertyFlowsInEveryRegime) {
+// Both level stores must reproduce the digests pinned on the map book at step 3.5.
+TEST(PinnedDigests, PropertyFlowsInEveryRegimeOnTheMapBook) {
   for (const Regime& rg : kRegimes) {
     expect_pinned("flow/" + std::string(rg.name), digest_flow<OrderBook>(rg, 1));
+  }
+}
+
+TEST(PinnedDigests, PropertyFlowsInEveryRegimeOnTheArrayBook) {
+  for (const Regime& rg : kRegimes) {
+    expect_pinned("flow/" + std::string(rg.name), digest_flow<ArrayOrderBook>(rg, 1));
   }
 }
 
