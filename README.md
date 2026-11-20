@@ -8,6 +8,7 @@
 **One market-making research system rather than three separate demos.** A Monte Carlo engine simulates a hidden fair value. Agents send orders around it into a C++20 limit order book. A market maker quotes into that book through a risk layer, and analytics score the result.
 
 > **Status:** Foundation done. **Project 1 (Monte Carlo engine) is complete.** **Phase 2, the C++20 limit order book, is under way.**
+> - **Project 2, step 3 (LOBSTER replay):** the engine rebuilt Nasdaq's AAPL book for 2012-06-21 and matched LOBSTER's 10-level book after all 400,390 events, with zero mismatches. 99.89% of Nasdaq's visible executions were reproduced by the engine's own matcher.
 > - **Project 2, step 2 (property tests):** 400,000 random calls with zero property violations, and the engine matches a naive reference model on every call. Twelve planted bugs are all caught, each shrunk to a counterexample of 1–3 calls.
 > - **Project 2, step 1 (matching engine):** price-time priority with O(1) cancel, all five order types plus cancel and modify, and an event stream. 66 GoogleTest cases pass under ASan/UBSan. In a 20,000-call random stress test, an L2 book rebuilt only from the engine's events matches the engine's book after every call.
 >
@@ -22,6 +23,37 @@
 > CI runs a gate for every step.
 
 ## Results so far
+
+### Limit order book: LOBSTER replay (Project 2, step 3)
+
+**The engine rebuilt Nasdaq's AAPL book for 2012-06-21 from LOBSTER's message file and matched LOBSTER's 10-level book after every one of 400,390 events.** That's 8.0 million price and size comparisons with zero mismatches. Nasdaq's own fills went through the engine as well. For 23,633 of 23,658 visible executions (99.89%), an aggressive order sent through the matcher filled exactly the order Nasdaq filled.
+
+| Replay of AAPL, 2012-06-21, 10 levels | Count |
+|---|---:|
+| Events replayed | 400,390 |
+| &nbsp;&nbsp;submissions / partial cancels / deletions | 191,014 / 3,260 / 171,126 |
+| &nbsp;&nbsp;visible / hidden executions | 23,658 / 11,332 |
+| **Events after which any visible level was wrong** | **0** |
+| **Events that could not be applied consistently** | **0** |
+| Visible executions filled by the engine's matcher, exactly as Nasdaq filled them | 23,633 (99.89%) |
+| Visible executions where Nasdaq filled an order that wasn't first in the queue | 25 (0.11%) |
+
+**How the replay works.**
+- **Submissions** go in as post-only orders. A submission that would cross means the rebuilt book is wrong, and the engine refuses it rather than trading.
+- **Executions:** LOBSTER records each one as a reduction of the resting order that was hit. When that order is first in the queue at the best price, the replay sends an IOC order through the matching engine, which must fill exactly that order.
+- **Hidden executions** don't change the visible book and are skipped.
+- **Orders resting before 09:30:** the first snapshot seeds each of its 20 visible levels as one block of anonymous liquidity.
+- **Liquidity outside the 10-level window:** a 10-level file carries no messages for orders outside the top 10. When a price scrolls into view, the replay rebuilds that level as an anonymous block of the size LOBSTER shows. That happened 111,305 times. In 82.6% of them, the replayed size was already right, but the level is rebuilt anyway because matching totals don't mean matching orders.
+- **Only newly visible prices are ever synced.** A level that was visible on the previous event must match from messages alone; a test checks that a visible level changing without a message counts as a mismatch.
+- **Orders the replay never saw:** 16,984 events name such an order (it rested before the open, or arrived out of view). These draw on the anonymous block at their price. That block is older than every order that joined the level after it, so first-in-first-out order still holds.
+
+**The 25 out-of-order executions.** In each one, LOBSTER shows Nasdaq filling the second order at the best price while an older visible order sat ahead of it. The replay counts them and reduces the order Nasdaq named, so the book stays true to what happened. LOBSTER data doesn't record order attributes, so it can't show why these orders were skipped.
+
+**Does the comparison have teeth?** Twelve real messages, three of each book-changing type, were each deleted from the day in turn. Every deletion was caught at exactly the event it was removed from. Tests on hand-built days do the same for a corrupted snapshot, a missing message and a stale out-of-view level.
+
+The whole day replays in 0.6 s on one core, CSV parsing included: about 700,000 events per second. That's a rough figure; step 4 measures latency properly.
+
+To reproduce, put the free LOBSTER sample in `data/` ([data/README.md](data/README.md)) and run `./build/release/lob/lob_replay data/AAPL_2012-06-21_34200000_57600000_message_10.csv`. The sample's terms don't cover redistribution, so it isn't committed and CI can't run the real-data gate. CI runs the replay's 17 tests on hand-built LOBSTER days instead.
 
 ### Limit order book: property tests (Project 2, step 2)
 
@@ -406,7 +438,7 @@ flowchart TB
 |---|---|---|---|
 | 0 · Foundation | Monorepo, CMake + uv, CI with ASan/UBSan, LOBSTER loader | CI green | ✅ done |
 | 1 · Monte Carlo engine | Pricer with error bars ✅ → variance reduction ✅ → Greeks ✅ → Asian/barrier/American (Longstaff–Schwartz) ✅ → Merton + Heston ✅ → SPY calibration ✅ → Numba ✅ | MC within its standard error of Black–Scholes | ✅ done |
-| 2 · Limit order book | Matching engine ✅ → property tests ✅ → LOBSTER replay → benchmarks → pybind11 → microstructure analytics | Rebuilt book matches LOBSTER on every event | 🔨 in progress |
+| 2 · Limit order book | Matching engine ✅ → property tests ✅ → LOBSTER replay ✅ → benchmarks → pybind11 → microstructure analytics | Rebuilt book matches LOBSTER on every event ✅ (AAPL: 400,390 events, 0 mismatches) | 🔨 in progress |
 | 3 · Market maker | Avellaneda–Stoikov, order-flow-imbalance skew, markouts, risk overlay | Walk-forward, out-of-sample, net of fees | ⏳ |
 | 4 · Add-ons | Delta-hedging PnL simulator, Almgren–Chriss execution on the book | — | ⏳ |
 
@@ -438,6 +470,7 @@ ctest --preset asan
 
 cmake --preset release && cmake --build --preset release
 ./build/release/lob/tests/lob_property_report   # step 2 tables: 400k calls, planted bugs (~12 s)
+./build/release/lob/lob_replay data/AAPL_2012-06-21_34200000_57600000_message_10.csv  # step 3 gate (~5 s)
 ```
 
 On Windows, use the `dev` or `release` preset with Visual Studio Build Tools. The sanitizer preset targets GCC/Clang, and CI runs it on Ubuntu.
@@ -515,7 +548,8 @@ quant-stack/
                       fast Heston surface pricer + calibration, Numba kernels (fast.py)
     experiments/      scripts that produce every number in this README
   lob/                Project 2: C++20 matching engine (order_book), id map, object pool,
-                      event stream
+                      event stream, LOBSTER reader and replay (lobster)
+    tools/            lob_replay: the step 3 gate on a real LOBSTER day
     tests/            GoogleTest suite, reference model, property harness + shrinker,
                       lob_property_report (step 2 gate)
   marketdata/         loaders: LOBSTER, option-chain snapshots → implied-vol surface
@@ -543,6 +577,7 @@ quant-stack/
 - Heston can't produce the steep 2-week skew. Adding jumps (Bates) is the natural next model.
 - Order book: opening a new price level allocates a map node, so "no allocation on the hot path" holds only for orders, not levels. Step 4's tick-indexed array removes that.
 - Order book: single-threaded, no self-trade prevention, no hidden or iceberg orders. Post-only orders are rejected rather than re-priced when they would cross.
+- LOBSTER replay: validated on one stock-day. More LOBSTER sample days (MSFT, for example) would broaden it. The real-data gate runs locally, not in CI, because the sample can't be redistributed.
 - Order book tests: the reference model and the engine share an author, so a misreading of the matching rules common to both would pass the comparison. The planted bugs show the checks can catch errors; they don't prove the rules match an exchange's. Step 3's replay against real Nasdaq data is that outside check.
 - Order book: if memory runs out while opening a new level, the book stays internally consistent but drops that order's unfilled remainder. Sizing the pool and id map up front keeps every other allocation off the trading path.
 

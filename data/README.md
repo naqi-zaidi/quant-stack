@@ -27,6 +27,17 @@ Market data lives here locally and is never committed (see `.gitignore`).
 and that the reference book is never crossed. A file that fails any check raises
 `LobsterFormatError` rather than loading silently.
 
+4. Replay it through the C++ matching engine (the Phase 2 step 3 gate):
+
+   ```
+   cmake --preset release && cmake --build --preset release
+   ./build/release/lob/lob_replay data/AAPL_2012-06-21_34200000_57600000_message_10.csv
+   ```
+
+   It prints the replay tables from the README and exits non-zero on any mismatch. Any LOBSTER
+   message file works if its orderbook file sits next to it; the level count comes from the
+   file name.
+
 ## SPY option-chain snapshot (committed)
 
 `snapshots/spy_options_2026-11-19.csv.gz` is the yfinance snapshot taken 2026-11-19 at
