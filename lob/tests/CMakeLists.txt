@@ -8,8 +8,12 @@ add_executable(lob_tests
   test_event_stream.cpp
   test_properties.cpp
   test_lobster.cpp
+  test_golden.cpp
+  test_digest.cpp
 )
 target_link_libraries(lob_tests PRIVATE lob::core qs_options GTest::gtest_main)
+# Snapshot tests read and (with UPDATE_GOLDEN=1) write lob/tests/golden/*.txt.
+target_compile_definitions(lob_tests PRIVATE LOB_GOLDEN_DIR="${CMAKE_CURRENT_SOURCE_DIR}/golden")
 gtest_discover_tests(lob_tests)
 
 # Step 2 gate: the property suite at scale, plus the planted-bug table for the README.

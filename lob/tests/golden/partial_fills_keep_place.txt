@@ -1,0 +1,40 @@
+# a partly filled maker keeps its place at the head of the queue
+
+> submit #1 Sell Limit 10 @ 101
+  = accepted: filled 0, resting 10, cancelled 0
+  report id=1 New Sell px=101 last=0 leaves=10 ts=1
+  level  Sell 101 qty=10 orders=1 ts=1
+
+> submit #2 Sell Limit 10 @ 101
+  = accepted: filled 0, resting 10, cancelled 0
+  report id=2 New Sell px=101 last=0 leaves=10 ts=2
+  level  Sell 101 qty=20 orders=2 ts=2
+
+> submit #10 Buy IOC 4 @ 101
+  = accepted: filled 4, resting 0, cancelled 0
+  report id=10 New Buy px=101 last=0 leaves=4 ts=3
+  trade  taker=10 maker=1 Buy 4 @ 101 ts=3
+  report id=1 Fill Sell px=101 last=4 leaves=6 ts=3
+  report id=10 Fill Buy px=101 last=4 leaves=0 ts=3
+  level  Sell 101 qty=16 orders=2 ts=3
+
+book
+  ask 101  16 in 2  [1:6 2:10]
+  ----
+  (no bids)
+
+> submit #11 Buy IOC 8 @ 101
+  = accepted: filled 8, resting 0, cancelled 0
+  report id=11 New Buy px=101 last=0 leaves=8 ts=4
+  trade  taker=11 maker=1 Buy 6 @ 101 ts=4
+  report id=1 Fill Sell px=101 last=6 leaves=0 ts=4
+  report id=11 Fill Buy px=101 last=6 leaves=2 ts=4
+  trade  taker=11 maker=2 Buy 2 @ 101 ts=4
+  report id=2 Fill Sell px=101 last=2 leaves=8 ts=4
+  report id=11 Fill Buy px=101 last=2 leaves=0 ts=4
+  level  Sell 101 qty=8 orders=1 ts=4
+
+book
+  ask 101  8 in 1  [2:8]
+  ----
+  (no bids)

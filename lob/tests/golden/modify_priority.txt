@@ -1,0 +1,62 @@
+# modify: size-down keeps priority, size-up and re-price lose it, a re-price through the spread trades
+
+> submit #1 Sell Limit 10 @ 101
+  = accepted: filled 0, resting 10, cancelled 0
+  report id=1 New Sell px=101 last=0 leaves=10 ts=1
+  level  Sell 101 qty=10 orders=1 ts=1
+
+> submit #2 Sell Limit 10 @ 101
+  = accepted: filled 0, resting 10, cancelled 0
+  report id=2 New Sell px=101 last=0 leaves=10 ts=2
+  level  Sell 101 qty=20 orders=2 ts=2
+
+> submit #3 Sell Limit 10 @ 101
+  = accepted: filled 0, resting 10, cancelled 0
+  report id=3 New Sell px=101 last=0 leaves=10 ts=3
+  level  Sell 101 qty=30 orders=3 ts=3
+
+> submit #4 Buy Limit 20 @ 99
+  = accepted: filled 0, resting 20, cancelled 0
+  report id=4 New Buy px=99 last=0 leaves=20 ts=4
+  level  Buy 99 qty=20 orders=1 ts=4
+
+> modify #1 to 4 @ 101
+  = accepted: filled 0, resting 4, cancelled 0
+  report id=1 Replaced Sell px=101 last=0 leaves=4 ts=5
+  level  Sell 101 qty=24 orders=3 ts=5
+
+> modify #2 to 15 @ 101
+  = accepted: filled 0, resting 15, cancelled 0
+  report id=2 Replaced Sell px=101 last=0 leaves=15 ts=6
+  level  Sell 101 qty=14 orders=2 ts=6
+  level  Sell 101 qty=29 orders=3 ts=6
+
+> modify #3 to 10 @ 102
+  = accepted: filled 0, resting 10, cancelled 0
+  report id=3 Replaced Sell px=102 last=0 leaves=10 ts=7
+  level  Sell 101 qty=19 orders=2 ts=7
+  level  Sell 102 qty=10 orders=1 ts=7
+
+book
+  ask 102  10 in 1  [3:10]
+  ask 101  19 in 2  [1:4 2:15]
+  ----
+  bid 99  20 in 1  [4:20]
+
+> modify #4 to 20 @ 101
+  = accepted: filled 19, resting 1, cancelled 0
+  report id=4 Replaced Buy px=101 last=0 leaves=20 ts=8
+  level  Buy 99 qty=0 orders=0 ts=8
+  trade  taker=4 maker=1 Buy 4 @ 101 ts=8
+  report id=1 Fill Sell px=101 last=4 leaves=0 ts=8
+  report id=4 Fill Buy px=101 last=4 leaves=16 ts=8
+  trade  taker=4 maker=2 Buy 15 @ 101 ts=8
+  report id=2 Fill Sell px=101 last=15 leaves=0 ts=8
+  report id=4 Fill Buy px=101 last=15 leaves=1 ts=8
+  level  Sell 101 qty=0 orders=0 ts=8
+  level  Buy 101 qty=1 orders=1 ts=8
+
+book
+  ask 102  10 in 1  [3:10]
+  ----
+  bid 101  1 in 1  [4:1]

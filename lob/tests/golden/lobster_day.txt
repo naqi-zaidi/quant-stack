@@ -1,0 +1,42 @@
+# LOBSTER replay of a five-event day (2 levels)
+# liquidity the replay seeds itself gets ids from 2^62 = 4611686018427387904 up
+
+> seed from the first snapshot
+  report id=4611686018427387904 New Buy px=5853300 last=0 leaves=100 ts=1
+  level  Buy 5853300 qty=100 orders=1 ts=1
+  (no asks)
+  ----
+  bid 5853300  100 in 1  [4611686018427387904:100]
+
+> event 1: submit #2 50 @ 5853500
+  report id=2 New Sell px=5853500 last=0 leaves=50 ts=2
+  level  Sell 5853500 qty=50 orders=1 ts=2
+  ask 5853500  50 in 1  [2:50]
+  ----
+  bid 5853300  100 in 1  [4611686018427387904:100]
+
+> event 2: submit #3 20 @ 5853200
+  report id=3 New Buy px=5853200 last=0 leaves=20 ts=3
+  level  Buy 5853200 qty=20 orders=1 ts=3
+  ask 5853500  50 in 1  [2:50]
+  ----
+  bid 5853300  100 in 1  [4611686018427387904:100]
+  bid 5853200  20 in 1  [3:20]
+
+> event 3: visible execution #2 10 @ 5853500
+  report id=13835058055282163712 New Buy px=5853500 last=0 leaves=10 ts=4
+  trade  taker=13835058055282163712 maker=2 Buy 10 @ 5853500 ts=4
+  report id=2 Fill Sell px=5853500 last=10 leaves=40 ts=4
+  report id=13835058055282163712 Fill Buy px=5853500 last=10 leaves=0 ts=4
+  level  Sell 5853500 qty=40 orders=1 ts=4
+  ask 5853500  40 in 1  [2:40]
+  ----
+  bid 5853300  100 in 1  [4611686018427387904:100]
+  bid 5853200  20 in 1  [3:20]
+
+> event 4: delete #3 20 @ 5853200
+  level  Buy 5853200 qty=0 orders=0 ts=5
+  report id=3 Cancelled(UserCancel) Buy px=5853200 last=20 leaves=0 ts=5
+  ask 5853500  40 in 1  [2:40]
+  ----
+  bid 5853300  100 in 1  [4611686018427387904:100]

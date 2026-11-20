@@ -20,6 +20,7 @@
 #include <string>
 #include <vector>
 
+#include "lob/digest.hpp"
 #include "lob/lobster.hpp"
 
 using namespace lob;
@@ -29,6 +30,8 @@ namespace {
 
 struct Run {
   ReplayStats stats;
+  std::uint64_t digest{0};  // FNV-1a 64 of every book event during the replay
+  std::size_t digest_events{0};
   std::vector<std::uint8_t> types;  // event type of each replayed event (main run only)
   double seconds{0};
 };
@@ -43,6 +46,8 @@ Run replay(const std::string& msg_path, const FileInfo& info, std::size_t drop, 
   Snapshot s;
   if (!rd.next(m, s)) throw std::runtime_error("empty file");
   Replay rp(info.levels);
+  EventDigest dg;
+  rp.set_listener(&dg);
   rp.seed(s, m.ns);
   Run run;
   std::size_t k = 0;
@@ -54,6 +59,8 @@ Run replay(const std::string& msg_path, const FileInfo& info, std::size_t drop, 
     if (stop_early && !ok) break;
   }
   run.stats = rp.stats();
+  run.digest = dg.value();
+  run.digest_events = dg.events();
   run.seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
   return run;
 }
@@ -106,7 +113,10 @@ int main(int argc, char** argv) try {
             << st.revealed_already_right << " (" << pct(st.revealed_already_right, st.revealed_levels)
             << ") |\n"
             << "| Events on orders never seen (drawn from anonymous liquidity) | "
-            << st.unknown_id_events << " |\n\n";
+            << st.unknown_id_events << " |\n"
+            << "| Book events emitted during the replay | " << main_run.digest_events << " |\n"
+            << "| Event-stream digest (FNV-1a 64) | `0x" << std::hex << std::setw(16)
+            << std::setfill('0') << main_run.digest << std::dec << std::setfill(' ') << "` |\n\n";
   if (st.first_mismatch != 0) {
     std::cout << "First mismatch at event " << st.first_mismatch << ": " << st.first_mismatch_detail
               << "\n\n";

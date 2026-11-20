@@ -1,0 +1,31 @@
+# post-only: rejected at and through the touch, rests when passive
+
+seeded book
+  ask 103  40 in 1  [4:40]
+  ask 102  30 in 1  [3:30]
+  ask 101  30 in 2  [1:10 2:20]
+  ----
+  bid 99  30 in 2  [5:10 6:20]
+  bid 98  30 in 1  [7:30]
+
+> submit #10 Buy PostOnly 5 @ 101
+  = rejected (WouldCross)
+  report id=10 Rejected(WouldCross) Buy px=101 last=0 leaves=0 ts=1
+
+> submit #11 Buy PostOnly 5 @ 110
+  = rejected (WouldCross)
+  report id=11 Rejected(WouldCross) Buy px=110 last=0 leaves=0 ts=2
+
+> submit #12 Sell PostOnly 5 @ 100
+  = accepted: filled 0, resting 5, cancelled 0
+  report id=12 New Sell px=100 last=0 leaves=5 ts=3
+  level  Sell 100 qty=5 orders=1 ts=3
+
+book
+  ask 103  40 in 1  [4:40]
+  ask 102  30 in 1  [3:30]
+  ask 101  30 in 2  [1:10 2:20]
+  ask 100  5 in 1  [12:5]
+  ----
+  bid 99  30 in 2  [5:10 6:20]
+  bid 98  30 in 1  [7:30]

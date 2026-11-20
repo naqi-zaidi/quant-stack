@@ -1,0 +1,44 @@
+# the standard book, order by order
+
+> submit #1 Sell Limit 10 @ 101
+  = accepted: filled 0, resting 10, cancelled 0
+  report id=1 New Sell px=101 last=0 leaves=10 ts=1
+  level  Sell 101 qty=10 orders=1 ts=1
+
+> submit #2 Sell Limit 20 @ 101
+  = accepted: filled 0, resting 20, cancelled 0
+  report id=2 New Sell px=101 last=0 leaves=20 ts=2
+  level  Sell 101 qty=30 orders=2 ts=2
+
+> submit #3 Sell Limit 30 @ 102
+  = accepted: filled 0, resting 30, cancelled 0
+  report id=3 New Sell px=102 last=0 leaves=30 ts=3
+  level  Sell 102 qty=30 orders=1 ts=3
+
+> submit #4 Sell Limit 40 @ 103
+  = accepted: filled 0, resting 40, cancelled 0
+  report id=4 New Sell px=103 last=0 leaves=40 ts=4
+  level  Sell 103 qty=40 orders=1 ts=4
+
+> submit #5 Buy Limit 10 @ 99
+  = accepted: filled 0, resting 10, cancelled 0
+  report id=5 New Buy px=99 last=0 leaves=10 ts=5
+  level  Buy 99 qty=10 orders=1 ts=5
+
+> submit #6 Buy Limit 20 @ 99
+  = accepted: filled 0, resting 20, cancelled 0
+  report id=6 New Buy px=99 last=0 leaves=20 ts=6
+  level  Buy 99 qty=30 orders=2 ts=6
+
+> submit #7 Buy Limit 30 @ 98
+  = accepted: filled 0, resting 30, cancelled 0
+  report id=7 New Buy px=98 last=0 leaves=30 ts=7
+  level  Buy 98 qty=30 orders=1 ts=7
+
+book
+  ask 103  40 in 1  [4:40]
+  ask 102  30 in 1  [3:30]
+  ask 101  30 in 2  [1:10 2:20]
+  ----
+  bid 99  30 in 2  [5:10 6:20]
+  bid 98  30 in 1  [7:30]

@@ -8,6 +8,7 @@
 **One market-making research system rather than three separate demos.** A Monte Carlo engine simulates a hidden fair value. Agents send orders around it into a C++20 limit order book. A market maker quotes into that book through a risk layer, and analytics score the result.
 
 > **Status:** Foundation done. **Project 1 (Monte Carlo engine) is complete.** **Phase 2, the C++20 limit order book, is under way.**
+> - **Project 2, step 3.5 (snapshot tests, pinned digests):** ten golden-file scenarios print the whole book and every event, and the event stream's FNV-1a digest is pinned for 18 fixed flows. Both are fixed before the level structure changes in step 4, which must reproduce them byte for byte.
 > - **Project 2, step 3 (LOBSTER replay):** the engine rebuilt Nasdaq's AAPL book for 2012-06-21 and matched LOBSTER's 10-level book after all 400,390 events, with zero mismatches. 99.89% of Nasdaq's visible executions were reproduced by the engine's own matcher.
 > - **Project 2, step 2 (property tests):** 400,000 random calls with zero property violations, and the engine matches a naive reference model on every call. Twelve planted bugs are all caught, each shrunk to a counterexample of 1–3 calls.
 > - **Project 2, step 1 (matching engine):** price-time priority with O(1) cancel, all five order types plus cancel and modify, and an event stream. 66 GoogleTest cases pass under ASan/UBSan. In a 20,000-call random stress test, an L2 book rebuilt only from the engine's events matches the engine's book after every call.
@@ -23,6 +24,36 @@
 > CI runs a gate for every step.
 
 ## Results so far
+
+### Limit order book: snapshot tests and pinned event digests (Project 2, step 3.5)
+
+**A safety net taken before step 4 rebuilds the price levels.** Two kinds of check fix the engine's current behaviour, so any change to it shows up as a diff.
+
+**Snapshot ("golden") tests.** Ten small scenarios print every call, its result, every event the book emitted in arrival order, and the book itself as a ladder. Each level shows its FIFO queue as `id:qty`. The text must equal [`lob/tests/golden/*.txt`](lob/tests/golden) byte for byte. Printing the whole state catches changes that no assertion anticipated. A snippet of [`modify_priority.txt`](lob/tests/golden/modify_priority.txt):
+
+```
+> modify #2 to 15 @ 101
+  = accepted: filled 0, resting 15, cancelled 0
+  report id=2 Replaced Sell px=101 last=0 leaves=15 ts=6
+  level  Sell 101 qty=14 orders=2 ts=6
+  level  Sell 101 qty=29 orders=3 ts=6
+...
+book
+  ask 102  10 in 1  [3:10]
+  ask 101  19 in 2  [1:4 2:15]
+  ----
+  bid 99  20 in 1  [4:20]
+```
+
+**Pinned event-stream digests.** Every event is serialized canonically (a tag byte, then each field as an 8-byte little-endian integer) and folded into an FNV-1a 64 digest. The bytes depend only on the event values, so CI and any compiler give the same digest. 18 digests are pinned in [`pinned_digests.hpp`](lob/tests/pinned_digests.hpp):
+- the fixed-seed property flow in each of the five regimes (2,000 calls each, 3,807–4,994 events);
+- the 13 hand-built LOBSTER replays, including the ones that hit errors.
+
+The real AAPL replay emits 1,283,305 book events with digest `0x089e41b222534921`. `lob_replay` prints it, so it can be checked locally.
+
+**Rules.**
+- To accept an intended change to a golden file, regenerate with `UPDATE_GOLDEN=1` and review the diff in the commit.
+- If a pinned digest changes, the commit message must say why. An unexplained change is a bug.
 
 ### Limit order book: LOBSTER replay (Project 2, step 3)
 
@@ -438,7 +469,7 @@ flowchart TB
 |---|---|---|---|
 | 0 · Foundation | Monorepo, CMake + uv, CI with ASan/UBSan, LOBSTER loader | CI green | ✅ done |
 | 1 · Monte Carlo engine | Pricer with error bars ✅ → variance reduction ✅ → Greeks ✅ → Asian/barrier/American (Longstaff–Schwartz) ✅ → Merton + Heston ✅ → SPY calibration ✅ → Numba ✅ | MC within its standard error of Black–Scholes | ✅ done |
-| 2 · Limit order book | Matching engine ✅ → property tests ✅ → LOBSTER replay ✅ → benchmarks → pybind11 → microstructure analytics | Rebuilt book matches LOBSTER on every event ✅ (AAPL: 400,390 events, 0 mismatches) | 🔨 in progress |
+| 2 · Limit order book | Matching engine ✅ → property tests ✅ → LOBSTER replay ✅ → snapshot tests + pinned digests ✅ → benchmarks → pybind11 → microstructure analytics | Rebuilt book matches LOBSTER on every event ✅ (AAPL: 400,390 events, 0 mismatches) | 🔨 in progress |
 | 3 · Market maker | Avellaneda–Stoikov, order-flow-imbalance skew, markouts, risk overlay | Walk-forward, out-of-sample, net of fees | ⏳ |
 | 4 · Add-ons | Delta-hedging PnL simulator, Almgren–Chriss execution on the book | — | ⏳ |
 
@@ -471,6 +502,9 @@ ctest --preset asan
 cmake --preset release && cmake --build --preset release
 ./build/release/lob/tests/lob_property_report   # step 2 tables: 400k calls, planted bugs (~12 s)
 ./build/release/lob/lob_replay data/AAPL_2012-06-21_34200000_57600000_message_10.csv  # step 3 gate (~5 s)
+
+# Accept an intended change to the snapshot tests, then review the diff before committing:
+UPDATE_GOLDEN=1 ./build/release/lob/tests/lob_tests --gtest_filter='Golden*'
 ```
 
 On Windows, use the `dev` or `release` preset with Visual Studio Build Tools. The sanitizer preset targets GCC/Clang, and CI runs it on Ubuntu.
@@ -551,7 +585,8 @@ quant-stack/
                       event stream, LOBSTER reader and replay (lobster)
     tools/            lob_replay: the step 3 gate on a real LOBSTER day
     tests/            GoogleTest suite, reference model, property harness + shrinker,
-                      lob_property_report (step 2 gate)
+                      lob_property_report (step 2 gate), pinned event digests
+      golden/         snapshot-test transcripts (step 3.5)
   marketdata/         loaders: LOBSTER, option-chain snapshots → implied-vol surface
   tests/              pytest + Hypothesis property tests
   data/               market data: committed snapshots in data/snapshots/, the rest git-ignored
@@ -565,6 +600,7 @@ quant-stack/
 - **Error bars on every headline number:** Monte Carlo tolerances are stated in standard errors, never as fixed decimals.
 - **Invariants, not just examples:** put–call parity, no-arbitrage bounds and vega ≥ 0 are checked across hundreds of generated parameter sets. LOBSTER files are checked for row alignment, monotone time and an uncrossed book.
 - **Production habits in C++:** integer tick prices (no floating-point price comparisons), `-Wall -Wextra -Wconversion -Werror`, and AddressSanitizer + UBSan in CI.
+- **Behaviour changes are visible:** golden transcripts change only through `UPDATE_GOLDEN=1` with the diff reviewed in the commit, and a changed pinned digest needs its reason in the commit message.
 
 ## Current limitations
 

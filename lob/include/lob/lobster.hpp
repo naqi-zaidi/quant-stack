@@ -144,11 +144,26 @@ class Replay {
   [[nodiscard]] const ReplayStats& stats() const noexcept { return st_; }
   [[nodiscard]] const OrderBook& book() const noexcept { return book_; }
 
+  // Receives every event the book emits during the replay, including the replay's own
+  // bookkeeping (seeding, rebuilding levels that scroll into view). Null to stop.
+  void set_listener(Listener* l) noexcept { tap_.next = l; }
+
  private:
+  // Keeps the trades the replay checks, and forwards every event to `next`.
   class TradeTap final : public Listener {
    public:
-    void on_trade(const Trade& t) override { trades.push_back(t); }
+    void on_trade(const Trade& t) override {
+      trades.push_back(t);
+      if (next != nullptr) next->on_trade(t);
+    }
+    void on_level_update(const LevelUpdate& u) override {
+      if (next != nullptr) next->on_level_update(u);
+    }
+    void on_report(const ExecReport& r) override {
+      if (next != nullptr) next->on_report(r);
+    }
     std::vector<Trade> trades;
+    Listener* next{nullptr};
   };
 
   static constexpr std::size_t idx(Side s) noexcept { return s == Side::Buy ? 0 : 1; }
