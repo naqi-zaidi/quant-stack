@@ -266,6 +266,18 @@ std::vector<OrderId> OrderBook::queue(Side side, Price price) const {
   });
 }
 
+std::vector<OrderView> OrderBook::orders(Side side) const {
+  return on_side(side, [](const auto& s) {
+    std::vector<OrderView> out;
+    for (const auto& [price, lvl] : s) {
+      for (const OrderNode* n = lvl.head; n != nullptr; n = n->next) {
+        out.push_back(OrderView{n->id, n->side, n->type, n->price, n->qty, n->ts});
+      }
+    }
+    return out;
+  });
+}
+
 std::optional<OrderView> OrderBook::find(OrderId id) const noexcept {
   const OrderNode* n = index_.find(id);
   if (n == nullptr) return std::nullopt;

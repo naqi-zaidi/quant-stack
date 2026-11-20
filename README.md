@@ -8,6 +8,7 @@
 **One market-making research system rather than three separate demos.** A Monte Carlo engine simulates a hidden fair value. Agents send orders around it into a C++20 limit order book. A market maker quotes into that book through a risk layer, and analytics score the result.
 
 > **Status:** Foundation done. **Project 1 (Monte Carlo engine) is complete.** **Phase 2, the C++20 limit order book, is under way.**
+> - **Project 2, step 2 (property tests):** 400,000 random calls with zero property violations, and the engine matches a naive reference model on every call. Twelve planted bugs are all caught, each shrunk to a counterexample of 1–3 calls.
 > - **Project 2, step 1 (matching engine):** price-time priority with O(1) cancel, all five order types plus cancel and modify, and an event stream. 66 GoogleTest cases pass under ASan/UBSan. In a 20,000-call random stress test, an L2 book rebuilt only from the engine's events matches the engine's book after every call.
 >
 > Project 1:
@@ -21,6 +22,79 @@
 > CI runs a gate for every step.
 
 ## Results so far
+
+### Limit order book: property tests (Project 2, step 2)
+
+**400,000 random calls, zero violations, and identical to a reference model on every call.** Twelve planted bugs are all caught, and the shrinker reduces each one to a counterexample of 1–3 calls.
+
+**The flows.** Seeded random order flow in five regimes:
+
+| Regime | What it stresses |
+|---|---|
+| Tight spread | frequent crossing near the inside |
+| Deep queues | two prices a side, so long first-in-first-out queues |
+| Wide book | up to 31 levels a side |
+| Cancel churn | 40% of calls are cancels |
+| Sweeps | large orders that walk several levels |
+
+Every flow mixes all five order types with cancels and modifies (size down, size up, re-price). About 3% of calls are malformed or stale on purpose: zero size, zero price, duplicate ids, unknown ids. Flows come from a splitmix64 generator, so a seed gives the same flow on any compiler. The standard library's distributions don't guarantee that.
+
+**The properties**, checked after every call against the book before and after it:
+
+| Property | What must hold |
+|---|---|
+| Uncrossed | best bid < best ask |
+| Accounting | filled + resting + cancelled = quantity sent. A rejection changes nothing. The order rests exactly where, and exactly as much as, the call reported. |
+| Conservation | total resting quantity moves by exactly what the call reported; trades add up to the fill |
+| Price-time priority | the orders hit are exactly the front of the opposite side's queue as it stood before the call |
+| Trade price | each trade prints at the maker's price, never through the taker's limit |
+| No early stop | an unfilled remainder means nothing crossable was left |
+| Order-type rules | market and IOC orders never rest; FOK fills in full; post-only never trades |
+| Queue position | orders the call didn't touch keep their relative order. A size-down keeps its place; any other modify goes to the back. |
+| Event stream (engine only) | open quantities rebuilt from exec reports, and the L2 book rebuilt from level updates, both match the book; `validate()` passes |
+
+**Reference model.** A deliberately naive second implementation keeps all resting orders in one flat vector and finds the next order to match by linear scan. It runs in lockstep with the engine. After every call they must agree exactly on the result, the trades, and the full order-level book (every order with its queue position and timestamp).
+
+| Regime | Flows | Calls | Trades | Property violations | Mismatches vs model |
+|---|---:|---:|---:|---:|---:|
+| Tight spread | 40 | 80,000 | 20,111 | 0 | 0 |
+| Deep queues | 40 | 80,000 | 14,608 | 0 | 0 |
+| Wide book | 40 | 80,000 | 14,858 | 0 | 0 |
+| Cancel churn | 40 | 80,000 | 10,196 | 0 | 0 |
+| Sweeps | 40 | 80,000 | 13,147 | 0 | 0 |
+| **All** | **200** | **400,000** | **72,920** | **0** | **0** |
+
+255,866 of the calls were accepted. The rest were rejected by design: malformed input, fill-or-kill orders that couldn't fill, post-only orders that would cross, and stale cancels.
+
+**Do the tests have teeth?** Each bug below is planted in the reference model (a test-only switch), and the suite has to find it:
+
+| Planted bug | Caught by | Calls until caught | Shrunk to | Model diff at call |
+|---|---|---:|---:|---:|
+| Newest order at a price fills first (LIFO) | price-time priority | 44 | 3 calls | 44 |
+| Worst crossing price fills first | price-time priority | 23 | 3 calls | 23 |
+| Trade prints at the taker's limit | trade price | 21 | 2 calls | 21 |
+| Matching trades one tick through the limit | trade price | 21 | 2 calls | 21 |
+| Matching stops after one price level | uncrossed | 23 | 3 calls | 23 |
+| Fill-or-kill fills partially | order-type rules | 35 | 1 call | 35 |
+| Post-only trades at an equal price | order-type rules | 13 | 2 calls | 13 |
+| IOC remainder rests | order-type rules | 2 | 1 call | 2 |
+| Size-down loses queue priority | queue position | 147 | 3 calls | 147 |
+| Size-up keeps queue priority | queue position | 172 | 3 calls | 90 |
+| Re-price through the spread rests without trading | uncrossed | 179 | 3 calls | 179 |
+| Full size rests after a partial fill | accounting | 21 | 2 calls | 21 |
+
+The model comparison catches the size-up bug 82 calls earlier than the properties do. At call 90, the order it hits is already last in its queue, so its position looks right. Only its timestamp is wrong, and the order-level comparison checks timestamps.
+
+**Shrinking.** A failing flow is cut down by delta debugging. First it deletes ever smaller chunks. Once the flow is short, it tries every single call and every pair of calls. Pairs matter because two orders can each exist only to set the other up. The LIFO bug, found at call 44, comes out as:
+
+```
+1. submit #1 Sell Limit 12 @ 998  -> filled 0, resting 12
+2. submit #2 Sell Limit 12 @ 998  -> filled 0, resting 12
+3. submit #3 Buy Limit 26 @ 1004  -> filled 24, resting 2 [12 from #2] [12 from #1]
+   violates price-time priority: trade 1 hit order 2, but next in priority was 1
+```
+
+The same harness shrinks real engine failures, replaying them on the engine itself. `lob_property_report` prints every table above in about 12 seconds, and CI runs it as a gate in the Release job. The GoogleTest suite runs a smaller version of the same checks under ASan/UBSan.
 
 ### Limit order book: the matching engine (Project 2, step 1)
 
@@ -332,7 +406,7 @@ flowchart TB
 |---|---|---|---|
 | 0 · Foundation | Monorepo, CMake + uv, CI with ASan/UBSan, LOBSTER loader | CI green | ✅ done |
 | 1 · Monte Carlo engine | Pricer with error bars ✅ → variance reduction ✅ → Greeks ✅ → Asian/barrier/American (Longstaff–Schwartz) ✅ → Merton + Heston ✅ → SPY calibration ✅ → Numba ✅ | MC within its standard error of Black–Scholes | ✅ done |
-| 2 · Limit order book | Matching engine ✅ → property tests → LOBSTER replay → benchmarks → pybind11 → microstructure analytics | Rebuilt book matches LOBSTER on every event | 🔨 in progress |
+| 2 · Limit order book | Matching engine ✅ → property tests ✅ → LOBSTER replay → benchmarks → pybind11 → microstructure analytics | Rebuilt book matches LOBSTER on every event | 🔨 in progress |
 | 3 · Market maker | Avellaneda–Stoikov, order-flow-imbalance skew, markouts, risk overlay | Walk-forward, out-of-sample, net of fees | ⏳ |
 | 4 · Add-ons | Delta-hedging PnL simulator, Almgren–Chriss execution on the book | — | ⏳ |
 
@@ -361,6 +435,9 @@ C++ core (needs CMake ≥ 3.25 and a C++20 compiler):
 cmake --preset asan          # Debug + AddressSanitizer + UBSan, warnings as errors
 cmake --build --preset asan
 ctest --preset asan
+
+cmake --preset release && cmake --build --preset release
+./build/release/lob/tests/lob_property_report   # step 2 tables: 400k calls, planted bugs (~12 s)
 ```
 
 On Windows, use the `dev` or `release` preset with Visual Studio Build Tools. The sanitizer preset targets GCC/Clang, and CI runs it on Ubuntu.
@@ -438,7 +515,9 @@ quant-stack/
                       fast Heston surface pricer + calibration, Numba kernels (fast.py)
     experiments/      scripts that produce every number in this README
   lob/                Project 2: C++20 matching engine (order_book), id map, object pool,
-                      event stream; GoogleTest suite in lob/tests/
+                      event stream
+    tests/            GoogleTest suite, reference model, property harness + shrinker,
+                      lob_property_report (step 2 gate)
   marketdata/         loaders: LOBSTER, option-chain snapshots → implied-vol surface
   tests/              pytest + Hypothesis property tests
   data/               market data: committed snapshots in data/snapshots/, the rest git-ignored
@@ -464,6 +543,7 @@ quant-stack/
 - Heston can't produce the steep 2-week skew. Adding jumps (Bates) is the natural next model.
 - Order book: opening a new price level allocates a map node, so "no allocation on the hot path" holds only for orders, not levels. Step 4's tick-indexed array removes that.
 - Order book: single-threaded, no self-trade prevention, no hidden or iceberg orders. Post-only orders are rejected rather than re-priced when they would cross.
+- Order book tests: the reference model and the engine share an author, so a misreading of the matching rules common to both would pass the comparison. The planted bugs show the checks can catch errors; they don't prove the rules match an exchange's. Step 3's replay against real Nasdaq data is that outside check.
 - Order book: if memory runs out while opening a new level, the book stays internally consistent but drops that order's unfilled remainder. Sizing the pool and id map up front keeps every other allocation off the trading path.
 
 ## License

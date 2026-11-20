@@ -54,3 +54,6 @@ jobs:
         run: cmake --build --preset ${{ matrix.preset }} -j 4
       - name: Test
         run: ctest --preset ${{ matrix.preset }}
+      - name: Phase 2 step 2 gate (order book holds every property; every planted bug caught)
+        if: matrix.preset == 'release'
+        run: ./build/release/lob/tests/lob_property_report

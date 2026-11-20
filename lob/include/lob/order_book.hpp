@@ -170,6 +170,9 @@ class OrderBook {
   [[nodiscard]] std::vector<LevelView> depth(Side side, std::size_t max_levels) const;
   // Ids resting at one price, in priority order (empty if no such level).
   [[nodiscard]] std::vector<OrderId> queue(Side side, Price price) const;
+  // L3 snapshot: every resting order on one side in priority order (best price first,
+  // oldest first within a price).
+  [[nodiscard]] std::vector<OrderView> orders(Side side) const;
   [[nodiscard]] std::optional<OrderView> find(OrderId id) const noexcept;
   [[nodiscard]] std::size_t order_count() const noexcept { return index_.size(); }
   [[nodiscard]] std::size_t level_count(Side side) const noexcept;
