@@ -7,7 +7,8 @@
 
 **One market-making research system rather than three separate demos.** A Monte Carlo engine simulates a hidden fair value. Agents send orders around it into a C++20 limit order book. A market maker quotes into that book through a risk layer, and analytics score the result.
 
-> **Status:** Foundation done. **Project 1 (Monte Carlo engine) and Project 2 (C++20 limit order book) are complete.** Project 3, the market maker, is next.
+> **Status:** Foundation done. **Project 1 (Monte Carlo engine) and Project 2 (C++20 limit order book) are complete.** **Project 3, the market maker, is under way.**
+> - **Project 3, step 1 (synthetic market):** Project 1's Monte Carlo engine simulates a hidden fair value, and noise and informed traders send orders into the C++ book. The mid stays a median 2.2 ticks from the fair value. Adverse selection is measurable: passive orders lose 4.2 ± 0.1 ticks per share over 10 seconds when they trade with informed flow (t = −51).
 > - **Project 2, step 6 (microstructure analytics):** spread distribution, depth profile, order-flow imbalance and queue positions, each a C++ listener that rebuilds its own view of the book from the event stream alone. On the AAPL day, all of them match the same statistics computed directly from LOBSTER's own book file, exactly. Order-flow imbalance explains 41% of 10-second price moves (95% CI 33–51%).
 > - **Project 2, step 5 (Python module):** `uv sync` builds the engine into a Python package, `orderbook`. From Python, it reproduces all ten C++ golden transcripts byte for byte and hashes to the pinned C++ digests. Replaying the AAPL day from Python gives 0 mismatches and the same 1,283,305-event digest as the C++ replay. A call costs about 0.3 µs from Python.
 > - **Project 2, step 4 (benchmarks):** a tick-indexed array of price levels makes the steady-state hot path allocation-free, closes a level 4.0× faster than an ordered map (31 vs 122 ns) and opens one 1.6× faster. On real AAPL flow, a delete takes about 40% less time at the median. It reproduces every golden transcript and pinned digest from step 3.5 byte for byte.
@@ -27,6 +28,41 @@
 > CI runs a gate for every step.
 
 ## Results so far
+
+### Market maker: the synthetic market (Project 3, step 1)
+
+**A market with something to be adversely selected by.** [`mm_strategy/market.py`](mm_strategy/market.py) sets it up:
+- **The hidden fair value.** Geometric Brownian motion simulated with Project 1's exact step (`mc_engine.gbm.paths`, 30% annualised, $100 at the open, on a 10 ms grid). No trader except the informed ones sees it.
+- **The traders,** sending orders into the C++ book (`orderbook.ArrayOrderBook`), each a Poisson process with its own random stream:
+  - **noise limit orders** (8/s) rest k ≥ 1 ticks behind the opposite best quote, with P(k) ∝ k^−0.7, and are cancelled after an exponential lifetime (mean 4 s) unless filled;
+  - **noise market orders** (1/s) buy or sell at random;
+  - **informed traders** (0.7/s) sweep every quote at least 2 ticks on the wrong side of the fair value.
+
+Noise orders alone would let the price wander. The informed sweeps drag it back to the fair value, picking off resting orders as they go. That is the adverse selection a market maker has to price in. Because the random streams are separate, the noise and informed arrival times stay the same whatever a market maker (step 2 on) adds to the market.
+
+**Gate** (`uv run python -m mm_strategy.experiments.market`, in CI): 20 one-hour sessions, seeds 1–20.
+
+| Statistic | Mean ± s.e. over sessions | Worst session | Gate |
+|---|---|---|---|
+| Share of time quoted on both sides | 0.9993 ± 0.0001 | 0.9982 | ≥ 0.99 in every session |
+| Median \|mid − fair value\| (ticks) | 2.15 ± 0.02 | 2.32 | < 5 in every session |
+| Correlation of 60 s mid and fair-value moves | 0.849 ± 0.010 | 0.724 | mean ≥ 0.6 |
+| Mean spread (ticks, time-weighted) | 2.15 ± 0.01 | 2.23 | – |
+| Mean depth at the best (shares) | 336 ± 1 | 327 | – |
+| OFI R², 10 s intervals | 0.431 ± 0.008 | 0.387 | – (AAPL day: 0.41) |
+
+Markouts measure how the mid moved after each fill, from that side's point of view, in ticks per share. At 10 seconds (each needs |t| > 4 across sessions):
+
+| Who | Volume per session (shares) | At the fill | After 10 s | t |
+|---|---:|---:|---:|---:|
+| informed takers | 438,340 | +0.79 | +4.19 ± 0.08 | +50.8 |
+| noise takers | 715,425 | −0.73 | −1.60 ± 0.04 | −44.4 |
+| passive orders vs noise flow | 715,425 | +0.73 | +1.60 ± 0.04 | +44.4 |
+| passive orders vs informed flow | 438,340 | −0.79 | −4.19 ± 0.08 | −50.8 |
+
+![Synthetic market](docs/figures/p3_market.png)
+
+The same seed reproduces the same session event for event (digest `0xd4d4c963a24bf6e0` for seed 1). An hour of market takes about 0.4 s. In 10-second intervals, OFI explains 43% of mid moves here and 41% on the real AAPL day. The market was not tuned to match that figure. Its parameters were chosen only for a two-sided book about two ticks wide whose mid tracks the fair value.
 
 ### Limit order book: microstructure analytics (Project 2, step 6)
 
@@ -664,7 +700,7 @@ flowchart TB
 | 0 · Foundation | Monorepo, CMake + uv, CI with ASan/UBSan, LOBSTER loader | CI green | ✅ done |
 | 1 · Monte Carlo engine | Pricer with error bars ✅ → variance reduction ✅ → Greeks ✅ → Asian/barrier/American (Longstaff–Schwartz) ✅ → Merton + Heston ✅ → SPY calibration ✅ → Numba ✅ | MC within its standard error of Black–Scholes | ✅ done |
 | 2 · Limit order book | Matching engine ✅ → property tests ✅ → LOBSTER replay ✅ → snapshot tests + pinned digests ✅ → benchmarks ✅ → pybind11 module ✅ → microstructure analytics ✅ | Rebuilt book matches LOBSTER on every event ✅ (AAPL: 400,390 events, 0 mismatches) | ✅ done |
-| 3 · Market maker | Avellaneda–Stoikov, order-flow-imbalance skew, markouts, risk overlay | Walk-forward, out-of-sample, net of fees | ⏳ |
+| 3 · Market maker | Synthetic market ✅ → harness, PnL split, markouts → Avellaneda–Stoikov → OFI skew (walk-forward) → historical replay → FYP risk overlay → head-to-head | Walk-forward, out-of-sample, net of fees | 🔨 in progress |
 | 4 · Add-ons | Delta-hedging PnL simulator, Almgren–Chriss execution on the book | — | ⏳ |
 
 ## Quickstart
@@ -686,6 +722,7 @@ uv run python -m mc_engine.experiments.calibration         # step 6: Heston fit 
 uv run python -m mc_engine.experiments.speed               # step 7: NumPy vs Numba throughput (~30 s)
 uv run python -m orderbook.gate                            # Phase 2 step 5: Python module gate (~10 s)
 uv run python -m orderbook.microstructure                  # Phase 2 step 6: analytics gate + figure (~15 s)
+uv run python -m mm_strategy.experiments.market            # Project 3 step 1: synthetic market gate (~12 s)
 ```
 
 C++ core (needs CMake ≥ 3.25 and a C++20 compiler):
@@ -800,6 +837,9 @@ quant-stack/
                       lob_property_report (step 2 gate), pinned event digests,
                       lob_alloc_check (step 4 gate)
       golden/         snapshot-test transcripts (step 3.5)
+  mm_strategy/        Project 3: synthetic market (hidden GBM fair value, noise and informed
+                      traders, event loop into the C++ book), markouts
+    experiments/      one gate per step (market.py: step 1)
   marketdata/         loaders: LOBSTER, option-chain snapshots → implied-vol surface
   tests/              pytest + Hypothesis property tests
   data/               market data: committed snapshots in data/snapshots/, the rest git-ignored
@@ -829,6 +869,7 @@ quant-stack/
 - Order book: single-threaded, no self-trade prevention, no hidden or iceberg orders. Post-only orders are rejected rather than re-priced when they would cross.
 - LOBSTER replay: validated on one stock-day. More LOBSTER sample days (MSFT, for example) would broaden it. The real-data gate runs locally, not in CI, because the sample can't be redistributed.
 - Order book tests: the reference model and the engine share an author, so a misreading of the matching rules common to both would pass the comparison. The planted bugs show the checks can catch errors; they don't prove the rules match an exchange's. Step 3's replay against real Nasdaq data is that outside check.
+- Synthetic market: the noise traders know nothing and the informed traders know everything. There are no momentum traders, no news jumps, and no other market makers yet. The fair value is GBM with constant volatility. The parameters were chosen for a sensible book, not fitted to a real stock.
 - Analytics: the windows count quote updates, not time. Time windows (the last 10 s, say) aren't built yet. The real-data check covers one stock-day and one tick size. The OFI regression pools the whole day. The queue tracker counts the replay's anonymous blocks (orders that rested before the open or outside the visible levels) as single orders.
 - Python module: crossing into C++ costs about 0.3 µs a call, so a strategy that sends millions of orders spends most of its engine time on the boundary. A batch call taking arrays would amortise it; it isn't built. Each book or replay belongs to one thread.
 - `uv sync` now compiles C++, so a fresh clone needs a compiler and CMake as well as uv. CI builds and tests the module on Linux only.

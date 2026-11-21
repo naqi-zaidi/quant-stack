@@ -31,7 +31,7 @@ build-backend = "scikit_build_core.build"
 minimum-version = "build-system.requires"
 cmake.version = ">=3.25"
 cmake.build-type = "Release"
-wheel.packages = ["mc_engine", "marketdata", "lob/python/orderbook"]
+wheel.packages = ["mc_engine", "marketdata", "mm_strategy", "lob/python/orderbook"]
 build-dir = "build/py/{wheel_tag}"
 
 [tool.scikit-build.cmake.define]

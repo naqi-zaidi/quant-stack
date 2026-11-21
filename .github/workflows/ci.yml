@@ -48,6 +48,8 @@ jobs:
         run: uv run python -m orderbook.gate
       - name: Phase 2 step 6 gate (microstructure analytics match brute-force recomputation)
         run: uv run python -m orderbook.microstructure --no-figure
+      - name: Project 3 step 1 gate (synthetic market reproducible; prices follow fair value; adverse selection at 4σ)
+        run: uv run python -m mm_strategy.experiments.market --no-figure
 
   cpp:
     name: C++ (${{ matrix.preset }})

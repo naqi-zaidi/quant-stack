@@ -369,7 +369,8 @@ class Regression:
 
 def ofi_regression(records: dict, t0: int, t1: int, bucket_s: float = 10.0,
                    boot: int = 2000, seed: int = 20261121) -> Regression:
-    """Mid-price change (cents) on OFI (shares) over consecutive `bucket_s` intervals."""
+    """Mid-price change (cents) on OFI (shares) over consecutive `bucket_s` intervals; boot=0
+    skips the bootstrap interval for R²."""
     ts = records["ts"].astype(np.int64)
     e = records["e"]
     two = (records["bid"] != NO_BID) & (records["ask"] != NO_ASK)
@@ -392,15 +393,17 @@ def ofi_regression(records: dict, t0: int, t1: int, bucket_s: float = 10.0,
     n = len(x)
     se = float(np.sqrt(n / (n - 2) * np.sum(xc**2 * resid**2)) / (xc @ xc))
     r2 = float(1 - (resid @ resid) / (yc @ yc))
-    rng = np.random.default_rng(seed)
-    r2s = np.empty(boot)
-    for b in range(boot):
-        i = rng.integers(0, n, n)
-        xb, yb = x[i] - x[i].mean(), y[i] - y[i].mean()
-        bb = (xb @ yb) / (xb @ xb)
-        rb = yb - bb * xb
-        r2s[b] = 1 - (rb @ rb) / (yb @ yb)
-    lo, hi = np.percentile(r2s, [2.5, 97.5])
+    lo = hi = float("nan")
+    if boot > 0:
+        rng = np.random.default_rng(seed)
+        r2s = np.empty(boot)
+        for b in range(boot):
+            i = rng.integers(0, n, n)
+            xb, yb = x[i] - x[i].mean(), y[i] - y[i].mean()
+            bb = (xb @ yb) / (xb @ xb)
+            rb = yb - bb * xb
+            r2s[b] = 1 - (rb @ rb) / (yb @ yb)
+        lo, hi = np.percentile(r2s, [2.5, 97.5])
     return Regression(bucket_s, n, beta, se, r2, float(lo), float(hi), x, y)
 
 
