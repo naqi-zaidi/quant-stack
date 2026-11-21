@@ -64,6 +64,8 @@ jobs:
         run: uv run python -m mm_strategy.experiments.head_to_head --sessions 2 --no-figure
       - name: Phase 4 step 1 gate (delta hedging; mean P&L exact; error falls as 1/√n, Derman–Kamal; turnover grows as √n)
         run: uv run python -m mc_engine.experiments.hedging --no-figure
+      - name: Phase 4 step 2 gate (Almgren–Chriss exact; executor fills and shortfall split exact; risk matches A–C; fast schedules pay more impact at 4σ)
+        run: uv run python -m mm_strategy.experiments.execution --sessions 6 --no-figure
 
   cpp:
     name: C++ (${{ matrix.preset }})

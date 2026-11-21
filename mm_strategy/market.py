@@ -39,10 +39,12 @@ NS = 1_000_000_000
 DOLLAR = 10_000  # LOBSTER price units per dollar
 TRADING_YEAR_HOURS = 252 * 6.5
 
-# Agent codes, carried in the top bits of every order id.
-NOISE_LIMIT, NOISE_MARKET, INFORMED, MAKER = 1, 2, 3, 4
+# Agent codes, carried in the top bits of every order id. MAKER and EXECUTOR belong to the
+# participant (the market maker of Project 3, the execution algorithm of Phase 4 step 2).
+NOISE_LIMIT, NOISE_MARKET, INFORMED, MAKER, EXECUTOR = 1, 2, 3, 4, 5
 AGENT_NAMES = {NOISE_LIMIT: "noise limit", NOISE_MARKET: "noise market", INFORMED: "informed",
-               MAKER: "market maker"}
+               MAKER: "market maker", EXECUTOR: "executor"}
+PARTICIPANT_AGENTS = (MAKER, EXECUTOR)
 ID_SHIFT = 40
 
 
@@ -86,10 +88,19 @@ class MarketParams:
     stress_len_s: float = 0.0
     stress_vol: float = 1.0
     stress_informed: float = 1.0
+    # An intraday activity profile (Phase 4 step 2): every agent arrives at its base rate times
+    # m(t) = 1 + profile_amp * (2t/T - 1)^2, busiest at the open and close (U-shaped). Off by
+    # default (profile_amp = 0), which leaves every session as it was.
+    profile_amp: float = 0.0
 
     @property
     def duration_ns(self) -> int:
         return int(self.hours * 3600 * NS)
+
+    def activity(self, t_s: float | np.ndarray) -> float | np.ndarray:
+        """The activity multiplier m(t) at t seconds from the open."""
+        x = 2 * np.asarray(t_s, dtype=float) / (self.hours * 3600) - 1
+        return 1 + self.profile_amp * x**2
 
 
 @dataclass
@@ -154,7 +165,7 @@ def simulate(p: MarketParams, seed: int, participant=None, record_tape: bool = F
     """Runs one session. `participant`, if given, is driven by the same event loop (the market
     maker of step 2 onwards). It gets `on_start(sim)`, then `on_event(sim, payload)` for each
     event it scheduled through `sim.schedule(t, sim.PARTICIPANT, payload)`, and
-    `on_fill(sim, trade)` for every trade with one of its own (MAKER) orders in it.
+    `on_fill(sim, trade)` for every trade with one of its own (MAKER or EXECUTOR) orders in it.
     record_tape=True also writes the session out as LOBSTER messages (Session.tape; step 5)."""
     return _Simulator(p, seed, participant, record_tape).run()
 
@@ -189,6 +200,7 @@ class _Simulator:
         self.now = 0
         self.participant = participant
         self.recorder = TapeRecorder() if record_tape else None
+        self.m_max = 1.0 + max(p.profile_amp, 0.0)  # arrivals are drawn at m_max, then thinned
 
     # ---- scheduling
 
@@ -197,7 +209,14 @@ class _Simulator:
         heapq.heappush(self.heap, (t, kind, self.seq, payload))
 
     def _next_arrival(self, rate: float, rng: np.random.Generator, kind: int) -> None:
-        self.schedule(self.now + int(rng.exponential(NS / rate)) + 1, kind)
+        self.schedule(self.now + int(rng.exponential(NS / (rate * self.m_max))) + 1, kind)
+
+    def _thinned(self, rng: np.random.Generator) -> bool:
+        """With an activity profile, an arrival drawn at the peak rate is dropped with
+        probability 1 - m(t)/m_max. Without one, no random number is used."""
+        if self.p.profile_amp == 0:
+            return False
+        return rng.random() >= self.p.activity(self.now / NS) / self.m_max
 
     # ---- market state
 
@@ -223,8 +242,9 @@ class _Simulator:
             if isinstance(e, Trade):
                 side = 1 if e.taker_side == Side.Buy else -1
                 self.trades.append((e.ts, e.price, e.qty, side, e.taker, e.maker))
-                if self.participant is not None and MAKER in (agent_of(e.maker),
-                                                              agent_of(e.taker)):
+                if self.participant is not None and (
+                        agent_of(e.maker) in PARTICIPANT_AGENTS
+                        or agent_of(e.taker) in PARTICIPANT_AGENTS):
                     self.participant.on_fill(self, e)
         return r
 
@@ -232,6 +252,9 @@ class _Simulator:
 
     def _noise_limit(self) -> None:
         rng, p = self.rng_limit, self.p
+        if self._thinned(rng):
+            self._next_arrival(p.limit_rate, rng, self.LIMIT)
+            return
         side = Side.Buy if rng.random() < 0.5 else Side.Sell
         k = self.placement.draw(rng)
         bid, ask = self.book.best_bid(), self.book.best_ask()
@@ -251,6 +274,9 @@ class _Simulator:
 
     def _noise_market(self) -> None:
         rng = self.rng_market
+        if self._thinned(rng):
+            self._next_arrival(self.p.market_rate, rng, self.MARKET)
+            return
         side = Side.Buy if rng.random() < 0.5 else Side.Sell
         self.call(NOISE_MARKET, self.book.submit, self.new_id(NOISE_MARKET), side, 0,
                   self.size(rng), OrderType.Market, self.now)
@@ -272,6 +298,9 @@ class _Simulator:
             if rng.random() >= 1 / p.stress_informed:
                 self._next_arrival(self._informed_rate_max(), rng, self.INFORMED_ARRIVAL)
                 return
+        if self._thinned(rng):
+            self._next_arrival(self._informed_rate_max(), rng, self.INFORMED_ARRIVAL)
+            return
         v = self.fair_value()
         edge = p.edge_ticks * p.tick
         bid, ask = self.book.best_bid(), self.book.best_ask()

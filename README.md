@@ -7,7 +7,8 @@
 
 **One market-making research system rather than three separate demos.** A Monte Carlo engine simulates a hidden fair value. Agents send orders around it into a C++20 limit order book. A market maker quotes into that book through a risk layer, and analytics score the result.
 
-> **Status:** Foundation done. **Projects 1, 2 and 3 are complete:** a Monte Carlo engine, a C++20 limit order book, and a market maker evaluated walk-forward on synthetic and real data. **Phase 4 is under way:** step 1, delta hedging, is done; Almgren–Chriss execution on the book is next.
+> **Status:** **Every phase is complete:** a Monte Carlo engine, a C++20 limit order book, a market maker evaluated walk-forward on synthetic and real data, and two add-ons, delta hedging and optimal execution.
+> - **Phase 4, step 2 (optimal execution):** sell 30,000 shares over 56 minutes on our own book, on a day that is busiest at the open and close. Almgren–Chriss's efficient frontier runs from TWAP (41 bp of price risk a share, 1.21 bp of impact) to a schedule with a 2.4-minute half-life (12 bp of risk, 2.96 bp of impact). Calibrated with one impact slope for the day, the model overstates the cost of front-loaded schedules by up to 78%, because they sell at the open, when the book is deep. With a slope per 5-minute bucket, fitted on the same probe orders, every schedule's realized cost is predicted within 0.06 bp. VWAP beats TWAP by 0.072 ± 0.013 bp (t = −5.7).
 > - **Phase 4, step 1 (delta hedging):** a short call sold at 20% implied vol, hedged 4 to 1,024 times over 3 months, with realized vol of 15%, 20% or 25%. Mean P&L equals BS(σi) − BS(σr) in all 45 cells, as it must exactly. Hedged at realized vol, the risk falls like 1/√n, within 3% of Derman & Kamal's formula. Hedged at implied vol, it levels off at 0.32–0.41 per call, because P&L converges path by path to ½ΓS²(σi² − σr²) summed over the path (corr 0.98 at σr = 15%). Turnover grows like √n, so costs set the hedging frequency: the best n halves each time the cost doubles (512, 256, 128 at 2, 5, 10 bp).
 > - **Project 3, step 7 (head-to-head, the Phase 3 gate):** six strategies in four environments, from one command, walk-forward and net of fees. A–S + flow is the only strategy profitable at 4σ: $249 ± 29 an hour live on the synthetic market, $276 ± 23 with the risk overlay, and profitable when replayed as well. It doesn't survive a hidden stress episode (−$20 ± 31) or Nasdaq's AAPL day, where every strategy loses money. Inventory skew cuts PnL risk at least five-fold in both the synthetic market and on AAPL.
 > - **Project 3, step 6 (risk overlay from my FYP):** the FYP's regime detector, anomaly scorer and Allow/Throttle/Pause state machine, ported with its frozen parameters and checked against the FYP's own code on 9,000 decisions, plus an inventory cap and a drawdown kill switch. The synthetic market gains hidden 5-minute stress episodes. The FYP policy flags every episode (median 11 s), but it covers only 17% of each episode's bars and throttles 11.6% of calm bars, failing its own 5% restraint test. The overlay matters most where inventory is otherwise uncontrolled. For a fixed spread under stress, it caps the position at about 600 shares (from 2,000), halves the worst drawdown and recovers $755 ± 182 an hour. For A–S + flow, which already controls its inventory, it adds +$38 ± 18. On AAPL it trims the losses by $67–83 an hour, but they remain.
@@ -35,6 +36,50 @@
 > CI runs a gate for every step.
 
 ## Results so far
+
+### Optimal execution: Almgren–Chriss on our own book (Phase 4, step 2)
+
+**One command** ([`experiments/execution.py`](mm_strategy/experiments/execution.py)): `uv run python -m mm_strategy.experiments.execution --sessions 40` (about 4 minutes). CI runs 6 days.
+
+**Setup.** Sell 30,000 shares of a $100 stock between minutes 2 and 58 of a one-hour session, about 1.8% of the market's volume. The order goes out in 120 child market orders, one every 28 s, into Project 3's synthetic market. That market gets a U-shaped day (`MarketParams(profile_amp=2)`): every agent arrives three times as often at the open and close as at midday. With flat activity, VWAP would just be TWAP. The profile is off by default, and every earlier session and gate output is byte-identical. Shortfall is measured against the arrival mid (Perold, 1988). On a $100 stock, a tick a share is 1 bp.
+
+**The model.** This is Almgren & Chriss's (2001) discrete model with linear temporary impact and no permanent impact. Our orders don't move the hidden fair value, and the informed traders buy the price back toward it. A child order of n shares costs ε + η·n ticks a share. While x_k shares wait, the price diffuses with volatility σ, so
+
+    E = ε·X + η·Σ n_k²,    V = σ²·τ·Σ x_k²,    min E + λV  ⇒  x_k = X·sinh(κ(T − t_k)) / sinh(κT),  cosh(κτ) = 1 + λσ²τ / (2η)
+
+λ = 0 gives TWAP. The pairs (V(λ), E(λ)) trace the efficient frontier, which [`execution.py`](mm_strategy/execution.py) gives in closed form. If η varies through the day, the first-order conditions are still a tridiagonal system. At λ = 0 its solution sells n_k ∝ 1/η_k, so where impact falls as volume rises, the cost-minimising schedule leans toward VWAP.
+
+**Calibration** uses seeds 1001–1010 and only what a trader could observe:
+- σ = 1.30 ± 0.06 ticks/√s, from the mid at 60-second sampling (the true value is 1.24).
+- The volume profile is 1.47× the mean in the first five minutes, 0.67× at midday and 1.50× in the last five.
+- 1,200 probe orders (random sizes from 50 to 1,500 shares, alternating buys and sells, every 28 s) give one slope for the day: cost = 0.61 + 2.34e-3·n ticks a share (R² 0.19).
+- Fitting a slope per 5-minute bucket gives η from 1.13e-3 at the open to 3.64e-3 at midday and 1.04e-3 at the close (R² 0.30).
+
+| Schedule | λ ($⁻¹) | First child | Predicted impact: one slope / per 5 min | Realized impact | Risk (A–C) | Shortfall, mean ± s.e. | Shortfall s.d. |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| TWAP | 0 | 250 | 1.19 / 1.21 | 1.210 ± 0.051 | 41.1 | −0.4 ± 8.3 | 52.4 |
+| VWAP | — | 367 | 1.24 / 1.13 | **1.138 ± 0.049** | 40.1 | −0.3 ± 8.1 | 51.0 |
+| A–C, κT = 2 | 1.4e-6 | 515 | 1.31 / 1.23 | 1.225 ± 0.054 | 33.4 | +0.1 ± 6.7 | 42.4 |
+| A–C, κT = 4 | 5.5e-6 | 984 | 1.79 / 1.44 | 1.406 ± 0.064 | 24.8 | +0.9 ± 4.9 | 30.7 |
+| A–C, κT = 8 | 2.2e-5 | 1,935 | 2.95 / 1.93 | 1.878 ± 0.078 | 17.3 | +2.0 ± 3.1 | 19.8 |
+| A–C, κT = 16 | 8.8e-5 | 3,745 | 5.28 / 2.95 | 2.958 ± 0.113 | 11.8 | +3.3 ± 1.9 | 11.9 |
+
+Basis points a share, 40 paired days. Impact is each fill against the hidden fair value at that moment: the cost. Risk is Almgren–Chriss's √V/X at the true σ. A κT of 2, 4, 8 or 16 is a trading half-life of 19, 10, 5 or 2.4 minutes.
+
+- **Here the frontier is steep.** Price risk dwarfs impact: 41 bp a share against 1.2 bp for TWAP. Selling with a 2.4-minute half-life cuts risk 3.5-fold, to 12 bp, for 1.75 ± 0.11 bp more impact (paired, t = 16.6). For this order, that's $524 more in expected cost to cut the s.d. of its outcome from $12,300 to $3,500. Which point to choose is the trader's λ.
+- **Shortfall alone can't rank the schedules in 40 days.** Its s.d. is 12–52 bp, nearly all of it from price moves, and every paired difference in shortfall is within 1 s.e. So cost is measured through the exact split: arrival + timing + impact adds up to shortfall, and the impact part varies by only 0.3–0.7 bp from day to day. The split needs the hidden fair value, which only a simulation has. Measured against the mid before each child, which a desk does see, the cost agrees with impact to within 0.07 bp.
+- **One impact slope misprices fast schedules; a slope per 5 minutes doesn't.** At the open and close, impact is at most 31% as steep as at its midday peak. Front-loaded schedules sell at the open, so Almgren–Chriss with the day's average slope overstates their cost: 5.28 bp against 2.96 realized at κT = 16, 78% too high. With a slope per 5-minute bucket, fitted on the same probes, every schedule is predicted within 0.06 bp. The frontier drawn with it lies below the one-slope frontier.
+- **VWAP beats TWAP, by a little.** VWAP saves 0.072 ± 0.013 bp (paired, t = −5.7), about $22 on this order, by selling more when the book is deep. The per-bucket model predicts VWAP at 1.13 bp against TWAP's 1.21.
+- **The risk formula holds.** The timing term depends only on the hidden fair value. Recomputed from each day's fills and the fair-value path alone, it matches the simulation exactly on all 40 days. Over 400 fair-value paths, each schedule's timing s.d. is within 3% of Almgren–Chriss's √V/X (41.6 against 41.1 for TWAP, 12.1 against 11.8 at κT = 16; every χ² p ≥ 0.45). Seeds 1–40 happen to be volatile, so the realized timing s.d. on the test days runs 4–29% above the prediction, depending on the schedule.
+- On 3 to 5 of the 40 days, depending on the schedule, a child order found fewer bids than its size. This happened even with TWAP's 250-share children. The executor rolled the rest into the next child.
+
+![Optimal execution](docs/figures/p4_execution.png)
+
+**Gate (CI).** All four checks are exact or a calibrated statistical test:
+1. **Theory.** For every λ used, the closed-form schedule equals the numerical minimiser of E + λV (to 3e-9 shares), and the closed-form (E, V) equal the direct sums (to 1e-15). λ = 0 gives TWAP, and per-bucket impact at λ = 0 sells n ∝ 1/η.
+2. **Execution.** Every schedule sells exactly 30,000 shares on every day. Shortfall equals arrival + timing + impact. An executor with nothing to sell leaves the day's event digest unchanged.
+3. **Risk.** The recomputed timing term matches the simulation exactly, and the 400-path χ² test passes at 4σ.
+4. **Cost.** κT = 16 pays more impact than TWAP at 4σ, paired.
 
 ### Delta hedging: what discrete hedging leaves behind (Phase 4, step 1)
 
@@ -1101,7 +1146,7 @@ flowchart TB
 | 1 · Monte Carlo engine | Pricer with error bars ✅ → variance reduction ✅ → Greeks ✅ → Asian/barrier/American (Longstaff–Schwartz) ✅ → Merton + Heston ✅ → SPY calibration ✅ → Numba ✅ | MC within its standard error of Black–Scholes | ✅ done |
 | 2 · Limit order book | Matching engine ✅ → property tests ✅ → LOBSTER replay ✅ → snapshot tests + pinned digests ✅ → benchmarks ✅ → pybind11 module ✅ → microstructure analytics ✅ | Rebuilt book matches LOBSTER on every event ✅ (AAPL: 400,390 events, 0 mismatches) | ✅ done |
 | 3 · Market maker | Synthetic market ✅ → harness, PnL split, markouts ✅ → Avellaneda–Stoikov ✅ → order-flow signal (walk-forward) ✅ → historical replay, with the replay's blind spot measured ✅ → FYP risk overlay ✅ → head-to-head ✅ | Walk-forward, out-of-sample, net of fees ✅ (met on the calm synthetic market; not under stress or on AAPL) | ✅ done |
-| 4 · Add-ons | Delta-hedging P&L simulator ✅ → Almgren–Chriss execution on the book | Mean P&L = BS(σi) − BS(σr) exactly; hedging error 1/√n (Derman–Kamal) ✅ | ⏳ step 1 of 2 |
+| 4 · Add-ons | Delta-hedging P&L simulator ✅ → Almgren–Chriss execution on the book, against TWAP and VWAP ✅ | Mean P&L = BS(σi) − BS(σr) exactly; hedging error 1/√n (Derman–Kamal) ✅. A–C closed form exact; realized execution cost predicted within 0.06 bp ✅ | ✅ done |
 
 ## Quickstart
 
@@ -1126,6 +1171,7 @@ uv run python -m mm_strategy.experiments.market            # Project 3 step 1: s
 uv run python -m mm_strategy.experiments.harness           # Project 3 step 2: maker harness gate (~45 s)
 uv run python -m mm_strategy.experiments.avellaneda        # Project 3 step 3: A–S γ sweep (~1.5 min; README used --sessions 40)
 uv run python -m mc_engine.experiments.hedging             # Phase 4 step 1: delta hedging gate + figure (~15 s)
+uv run python -m mm_strategy.experiments.execution --sessions 40  # Phase 4 step 2: A–C vs TWAP/VWAP (~4 min)
 ```
 
 C++ core (needs CMake ≥ 3.25 and a C++20 compiler):
@@ -1223,6 +1269,18 @@ from mc_engine.hedging import delta_hedge, gbm_grid
 paths = gbm_grid(100, 0.03, 0.15, 0.25, n_steps=1024, n_paths=20_000, seed=0)
 h = delta_hedge(paths, 100, 0.25, 0.03, sigma_implied=0.20, sigma_hedge=0.15, n_rebalances=64)
 h.mean_se(), h.pnl.std(), h.net(5e-4).mean()  # ≈ BS(20%) − BS(15%), the spread, after 5 bp
+
+# Almgren–Chriss: sell 30,000 shares in 120 children 28 s apart, then trade it on the book
+from mm_strategy import execution as ex
+from mm_strategy.market import MarketParams, simulate
+
+impact = ex.ImpactModel(epsilon=0.61, eta=2.34e-3)        # ticks a share, per share of child
+lam = ex.lam_for_kappa(8 / 3360, 1.3, 28, impact.eta)     # risk aversion for κT = 8
+x = ex.ac_holdings(30_000, 120, 28, 1.3, impact.eta, lam)  # shares left after each child
+ex.frontier_point(30_000, 120, 28, 1.3, impact, lam)      # (E, V) on the efficient frontier
+bot = ex.Executor(start_s=120, tau_s=28, sizes=ex.child_sizes(x))
+day = simulate(MarketParams(profile_amp=2.0), seed=1, participant=bot)
+ex.shortfall(day, bot, arrival_s=120)                      # total = arrival + timing + impact
 ```
 
 ## Layout
@@ -1255,12 +1313,15 @@ quant-stack/
                       accounting, calibration of σ and fill intensity, order-flow signals
                       with the walk-forward (signals.py), sessions written out as LOBSTER
                       tapes (tape.py), makers with virtual, queue-aware orders trading a
-                      replayed tape (replay.py), and the risk overlay ported from my FYP
-                      (risk.py)
+                      replayed tape (replay.py), the risk overlay ported from my FYP
+                      (risk.py), and optimal execution: Almgren–Chriss, TWAP, VWAP, an
+                      executor that trades them on the book, implementation shortfall
+                      (execution.py, Phase 4 step 2)
     experiments/      one gate per step (market.py: step 1, harness.py: step 2,
                       avellaneda.py: step 3, flow.py: step 4, blind_spot.py: step 5 in CI,
                       aapl.py: step 5 on the AAPL day, local only, risk.py: step 6, with
-                      risk_aapl.py for its AAPL half, head_to_head.py: step 7)
+                      risk_aapl.py for its AAPL half, head_to_head.py: step 7,
+                      execution.py: Phase 4 step 2)
   marketdata/         loaders: LOBSTER, option-chain snapshots → implied-vol surface
   tests/              pytest + Hypothesis property tests; data/ holds the FYP traces that
                       the risk overlay must reproduce (make_fyp_traces.py regenerates them)
@@ -1279,6 +1340,7 @@ quant-stack/
 
 ## Current limitations
 
+- Optimal execution: only synthetic data. A replay can't be used, because a replayed tape doesn't react to our orders, so impact would be counted once and then forgotten. Children are market orders, at least 28 s apart, so the book recovers between them. Faster trading would need a model of impact that decays over time, and there are no passive (limit-order) children. The market has no permanent impact by construction, and the U-shaped day is a stylised profile, not one fitted to a real stock. The timing/impact split needs the hidden fair value, so a real desk would measure cost against the mid (which agrees here within 0.07 bp).
 - Delta hedging: GBM with constant volatility, so implied vol never moves and there are no jumps. The stock drifts at r; with a real-world drift, the mean-P&L identity holds only as n → ∞. Rebalancing is on an even clock, not on moves (no Whalley–Wilmott bands). Costs are proportional, with no spread that widens in fast markets. The best n minimises one criterion, the RMSE around the frictionless target, for one contract.
 - Barriers: only the down-and-out call with barrier ≤ strike has a closed form here. The bridge correction works for any single barrier, but the other cases have no reference yet.
 - Longstaff–Schwartz gives a lower bound only, with a fixed cubic basis. An Andersen–Broadie duality upper bound would bracket the true price from both sides.
