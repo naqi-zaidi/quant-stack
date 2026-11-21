@@ -95,20 +95,25 @@ class PnL:
         return x / 10_000
 
 
+def split_pnl(side: np.ndarray, qty: np.ndarray, price: np.ndarray, mid2_before: np.ndarray,
+              mid2_end: int, cash: int, inventory: int, fees: int) -> PnL:
+    """The exact split, from fills (side +1 buy / -1 sell, qty, price), bid + ask just before
+    each fill, bid + ask at the close, and the maker's own cash, inventory and fees."""
+    sq = side * qty
+    spread2 = int((sq * (mid2_before - 2 * price)).sum())
+    inv2 = int((sq * (mid2_end - mid2_before)).sum())
+    # Net PnL from the maker's own books, marked at the closing mid (all doubled: exact).
+    net2 = 2 * cash + inventory * mid2_end
+    holds = net2 == spread2 + inv2 - 2 * fees
+    return PnL(net=net2 // 2, spread=spread2 // 2, inventory=inv2 // 2, fees=fees,
+               volume=int(qty.sum()), end_inventory=inventory, identity_holds=holds)
+
+
 def decompose(session: Session, mm: MarketMaker) -> PnL:
     f = maker_fills_from_engine(session)
     _, m2 = mid2_series(session)
-    m2_end = int(m2[-1])
-    m2_i = mid2_before(session, f["ts"])
-    sq = f["side"] * f["qty"]
-    spread2 = int((sq * (m2_i - 2 * f["price"])).sum())
-    inv2 = int((sq * (m2_end - m2_i)).sum())
-    fees = mm.fees_paid
-    # Net PnL from the maker's own books, marked at the closing mid (all doubled: exact).
-    net2 = 2 * mm.cash + mm.inventory * m2_end
-    holds = net2 == spread2 + inv2 - 2 * fees
-    return PnL(net=net2 // 2, spread=spread2 // 2, inventory=inv2 // 2, fees=fees,
-               volume=int(f["qty"].sum()), end_inventory=mm.inventory, identity_holds=holds)
+    return split_pnl(f["side"], f["qty"], f["price"], mid2_before(session, f["ts"]), int(m2[-1]),
+                     mm.cash, mm.inventory, mm.fees_paid)
 
 
 def maker_markouts(session: Session, horizons_s: tuple[float, ...]) -> dict:

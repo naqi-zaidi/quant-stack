@@ -95,6 +95,23 @@ class FixedSpread:
 
 
 @dataclass(frozen=True)
+class JoinBest:
+    """Quote at everyone else's best bid and ask, joining the back of each queue (the
+    real-data baseline of step 5, where the spread is many ticks wide)."""
+
+    size: int = 100
+    max_inventory: int = 2_000
+
+    def quote(self, v: MarketView) -> Quotes:
+        return Quotes(
+            v.bid if v.inventory + self.size <= self.max_inventory else None,
+            v.ask if v.inventory - self.size >= -self.max_inventory else None,
+            self.size,
+            self.size,
+        )
+
+
+@dataclass(frozen=True)
 class AvellanedaStoikov:
     """Avellaneda and Stoikov (2008), "High-frequency trading in a limit order book".
 

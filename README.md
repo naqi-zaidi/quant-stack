@@ -8,6 +8,7 @@
 **One market-making research system rather than three separate demos.** A Monte Carlo engine simulates a hidden fair value. Agents send orders around it into a C++20 limit order book. A market maker quotes into that book through a risk layer, and analytics score the result.
 
 > **Status:** Foundation done. **Project 1 (Monte Carlo engine) and Project 2 (C++20 limit order book) are complete.** **Project 3, the market maker, is under way.**
+> - **Project 3, step 5 (historical replay):** makers trade a replayed tape with virtual orders that wait their turn in the queue. The replay was measured first on the synthetic market, where the same strategy can also trade live. It shows a strategy exactly the live market (every decision of all 40 sessions), keeps the four strategies in the same order, and is at most $135 ± 26 an hour too optimistic. On Nasdaq's AAPL day, walk-forward over 11 half-hour blocks, nothing makes money. A–S loses $1,099 ± 159 an hour and loses in every block. The flow signal's forecast falls to R² 0.4% (from 3.6%) and doesn't change the PnL (−$25 ± 38). On AAPL, past order flow predicts continuation.
 > - **Project 3, step 4 (order-flow signal, walk-forward):** three features of the book predict the mid's next 5 seconds out of sample (R² 3.6% ± 0.15 against no change, above zero on all 40 test days). Moving Avellaneda–Stoikov's reservation price by the prediction turns −$87 ± 30 an hour into **+$249 ± 29**, net of fees, and beats plain A–S in all 40 paired sessions (+$336 ± 18, t = 19). The whole gain is inventory PnL: fills against informed and noise traders both improve by about a third of a tick. Order-flow imbalance on its own predicts reversal here, not continuation.
 > - **Project 3, step 3 (Avellaneda–Stoikov):** calibrated to the market (σ, and the fill-intensity decay k). Its inventory skew cuts mean inventory from about 1,000 shares to 99 (t = −32), and PnL risk to a fifth of the best fixed spread's at the same mean PnL. It beats the 1-tick spread by $874 ± 180 an hour, but it still loses $87 ± 30 an hour to informed flow.
 > - **Project 3, step 2 (market-making harness):** a maker quotes through the C++ book. Its books reconcile exactly with the engine's trade record, and PnL splits exactly into spread capture, inventory PnL and fees. A fixed-spread baseline captures about $2,400 an hour in spread but loses more than that on its inventory; Avellaneda–Stoikov's inventory skew comes next.
@@ -31,6 +32,75 @@
 > CI runs a gate for every step.
 
 ## Results so far
+
+### Market maker: replaying the AAPL day, after measuring what a replay misses (Project 3, step 5)
+
+**Virtual orders that wait their turn** ([`mm_strategy/replay.py`](mm_strategy/replay.py)). A tape is a stream of LOBSTER messages. Project 2's C++ replay rebuilds the book from it message by message, and makers trade against that book with orders that never enter it, so nothing in the market reacts to them. Each virtual order keeps its place in the queue:
+- it joins behind the displayed size already resting at its price;
+- cancels and executions of orders that were there first shrink the queue ahead of it; orders that arrive later join behind it;
+- an execution at its price fills it once nothing is left ahead, and an execution at a worse price (an aggressor who went past it) fills it at once;
+- a hidden execution fills it at a worse price, or at its own price with nothing ahead (displayed orders have priority).
+
+Order management mirrors the live maker: a size cut keeps the queue place, and a new price goes to the back of the new queue. Any number of makers can trade in one pass, since none of them changes the book.
+
+**First, the blind spot, measured on the synthetic market** ([`experiments/blind_spot.py`](mm_strategy/experiments/blind_spot.py)). [`mm_strategy/tape.py`](mm_strategy/tape.py) writes a synthetic session out as a LOBSTER tape. Each strategy then trades the same seed twice:
+- live, where informed traders pick off its stale quotes and noise traders price their orders off it;
+- replayed on the tape of that session without the maker.
+
+The gate checks fidelity first. With no maker, the replay shows a strategy exactly what the live session showed: all five levels on each side, at every one of 36,000 decisions, in 40 of 40 sessions. Run with `uv run python -m mm_strategy.experiments.blind_spot --sessions 40`; CI runs 6.
+
+| Strategy | Live net ($/hour) | Replayed | Replayed − live | Replayed, if crossing orders filled | Replayed − live |
+|---|---:|---:|---:|---:|---:|
+| fixed 1 tick | −961 ± 184 | −1,098 ± 158 | −137 ± 132 | −98 ± 164 | +863 ± 135 |
+| fixed 3 ticks | −160 ± 149 | −107 ± 161 | +54 ± 133 | +507 ± 165 | +667 ± 140 |
+| A–S | −87 ± 30 | −28 ± 32 | +59 ± 25 | +346 ± 25 | +433 ± 28 |
+| A–S + flow | +271 ± 27 | +406 ± 25 | +135 ± 26 | +930 ± 26 | +659 ± 34 |
+
+| Difference ($/hour) | Live | Replayed | Replayed − live |
+|---|---:|---:|---:|
+| A–S + flow − A–S | +358 ± 19 | +435 ± 20 | +76 ± 22 |
+| A–S − fixed 3 ticks | +73 ± 147 | +78 ± 150 | +5 ± 131 |
+| A–S − fixed 1 tick | +874 ± 180 | +1,070 ± 148 | +196 ± 130 |
+
+Here A–S + flow uses one model fitted on the history block, live and replayed alike, without step 4's daily refits. That's why its live figure differs a little from step 4's.
+
+![Live vs replayed](docs/figures/p3_blind_spot.png)
+
+**What the replay gets right and wrong:**
+- It keeps the four strategies in the same order. The differences between them survive, but the flow signal's gain is overstated by about a fifth (+$76 ± 22).
+- It's too optimistic for the A–S family, by $59 to $135 an hour. For fixed spreads, the bias is indistinguishable from zero.
+- Without anyone reacting, replayed makers trade less with informed traders (25–29% of volume against 36–44% live). The informed fills they do get lose more per share (−5.6 to −6.2 ticks at 10 s, against −3.5 to −4.3).
+- Counting new limit orders priced through the maker's quote as fills would add $433 to $863 an hour. In the tape, those orders were placed against a book without the maker, and live, none of them happen. So the replay doesn't count them.
+
+**Then AAPL, walk-forward within the day** ([`experiments/aapl.py`](mm_strategy/experiments/aapl.py); local only, because the LOBSTER sample can't be redistributed). The day is cut into 30-minute blocks, and each block is a session: the maker starts flat, its A–S horizon is the block's end, and it is marked to the mid when the block ends.
+- 9:30–10:30 is the history block. The 11 blocks from 10:30 to 16:00 are traded walk-forward.
+- At the start of each block, σ, k and the flow model are refitted on every earlier block.
+- Nothing is tuned on AAPL. γ = 3e−4 is the same risk aversion in dollars as on the synthetic market, where a tick and a lot are also one cent and 100 shares. The 5 s horizon and the weight of 1 come from step 4.
+- The baseline is **join the best**: quote at the best bid and ask, at the back of each queue.
+
+The gate checks what must hold exactly: the replayed book matches LOBSTER's after all 400,390 messages, the PnL identity holds for every maker in every block, and every block's flow model refits exactly from the blocks before it. Run with `uv run python -m mm_strategy.experiments.aapl` (about 35 s).
+
+| Strategy | Net PnL ($/hour) | Spread capture | Inventory PnL | Volume | Mean \|inventory\| | 10 s markout (ticks) | Blocks > 0 |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| join the best | −727 ± 1,106 | +1,648 | −2,462 | 43,265 | 936 | −1.11 ± 0.41 | 6 of 11 |
+| A–S | −1,099 ± 159 | +1,300 | −2,502 | 51,469 | 105 | −2.55 ± 0.25 | 0 of 11 |
+| A–S + flow | −1,124 ± 163 | +1,220 | −2,447 | 51,043 | 100 | −2.68 ± 0.20 | 0 of 11 |
+
+Paired across blocks: A–S + flow − A–S −$25 ± 38 (t = −0.7); A–S − join the best −$372 ± 1,070 (t = −0.3). Standard errors are across the 11 blocks of one day, which aren't independent, so treat them as rough.
+
+- **Inputs, refitted walk-forward:** σ 3.50–5.36 ticks/√s, k 0.307–0.442 per tick (intensity fit R² 0.979–0.986). In the first test block, A–S quotes 22.0 ticks wide at the block's start and 6.5 at its end, against a median market spread of 15, and moves r 7.7 ticks per 100 shares at mid-block.
+- **Forecast:** R²_oos 0.42% ± 0.21% per block (t = 2.0), above zero in 10 of 11 blocks. That's about a ninth of its out-of-sample skill on the synthetic market (3.61%).
+- **The coefficients:** order-flow imbalance's is positive in every refit (+0.063 to +0.097 ticks per 100 shares), so on AAPL past order flow predicts continuation, the opposite of the synthetic market. The last second's move carries almost nothing (−0.006 to +0.027 per tick).
+- **Fills:** A–S's come 5% from its queue clearing, 49% from executions that traded through its price, and 46% from hidden executions. Every hidden execution that day happened strictly inside the visible spread (35% of executed volume), and that's where A–S's quotes sit for much of each block. Join the best: 34%, 42% and 24%.
+- **Crossing orders** would be only 6–10% of AAPL volume, and counting them as fills leaves every net PnL within noise.
+
+![AAPL replay](docs/figures/p3_aapl.png)
+
+**What it means:**
+- On the synthetic market, A–S + flow makes money live, and the replay agrees to within about $135 an hour.
+- On AAPL, nothing makes money net of rebates from 10:30 to 16:00, and on the synthetic market this replay errs on the optimistic side. A–S loses in all 11 blocks. Its quotes are narrower than the market's for much of each block, and its fills lose 2.55 ticks a share within 10 s.
+- The flow signal barely forecasts AAPL's 5-second moves and doesn't change the PnL. The step 4 edge came from a market whose informed traders are deliberately simple, and it doesn't carry over to this day.
+- Join the best has the best markouts, but it carries about 900 shares with no skew, so its PnL is too noisy to separate from zero or from A–S.
 
 ### Market maker: an order-flow signal, fitted walk-forward (Project 3, step 4)
 
@@ -868,7 +938,7 @@ flowchart TB
 | 0 · Foundation | Monorepo, CMake + uv, CI with ASan/UBSan, LOBSTER loader | CI green | ✅ done |
 | 1 · Monte Carlo engine | Pricer with error bars ✅ → variance reduction ✅ → Greeks ✅ → Asian/barrier/American (Longstaff–Schwartz) ✅ → Merton + Heston ✅ → SPY calibration ✅ → Numba ✅ | MC within its standard error of Black–Scholes | ✅ done |
 | 2 · Limit order book | Matching engine ✅ → property tests ✅ → LOBSTER replay ✅ → snapshot tests + pinned digests ✅ → benchmarks ✅ → pybind11 module ✅ → microstructure analytics ✅ | Rebuilt book matches LOBSTER on every event ✅ (AAPL: 400,390 events, 0 mismatches) | ✅ done |
-| 3 · Market maker | Synthetic market ✅ → harness, PnL split, markouts ✅ → Avellaneda–Stoikov ✅ → order-flow signal (walk-forward) ✅ → historical replay → FYP risk overlay → head-to-head | Walk-forward, out-of-sample, net of fees | 🔨 in progress |
+| 3 · Market maker | Synthetic market ✅ → harness, PnL split, markouts ✅ → Avellaneda–Stoikov ✅ → order-flow signal (walk-forward) ✅ → historical replay, with the replay's blind spot measured ✅ → FYP risk overlay → head-to-head | Walk-forward, out-of-sample, net of fees | 🔨 in progress |
 | 4 · Add-ons | Delta-hedging PnL simulator, Almgren–Chriss execution on the book | — | ⏳ |
 
 ## Quickstart
@@ -1010,10 +1080,13 @@ quant-stack/
   mm_strategy/        Project 3: synthetic market (hidden GBM fair value, noise and informed
                       traders, event loop into the C++ book), markouts, the market maker
                       (maker.py: quoting, fills, fixed spread, Avellaneda–Stoikov), its
-                      accounting, calibration of σ and fill intensity, and order-flow
-                      signals with the walk-forward (signals.py)
+                      accounting, calibration of σ and fill intensity, order-flow signals
+                      with the walk-forward (signals.py), sessions written out as LOBSTER
+                      tapes (tape.py), and makers with virtual, queue-aware orders trading
+                      a replayed tape (replay.py)
     experiments/      one gate per step (market.py: step 1, harness.py: step 2,
-                      avellaneda.py: step 3, flow.py: step 4)
+                      avellaneda.py: step 3, flow.py: step 4, blind_spot.py: step 5 in CI,
+                      aapl.py: step 5 on the AAPL day, local only)
   marketdata/         loaders: LOBSTER, option-chain snapshots → implied-vol surface
   tests/              pytest + Hypothesis property tests
   data/               market data: committed snapshots in data/snapshots/, the rest git-ignored
@@ -1046,6 +1119,8 @@ quant-stack/
 - Avellaneda–Stoikov is calibrated once, on separate sessions, and held fixed. σ is estimated at 60-second sampling, which still sits 2.4 s.e. above the true value. The finite-horizon formulas make the skew strongest at the open, so this session-long horizon is a modelling choice.
 - Market maker: PnL is marked to the closing mid, without the cost of flattening the position. Decisions come on a fixed 100 ms clock, with no reaction to individual book events, and the quote size ignores queue position. Fees are illustrative, not one exchange's schedule.
 - Order-flow signal: linear in three features, scored on decisions every 100 ms with overlapping 5-second targets. Standard errors come from session-to-session variation, which is valid because sessions are independent; row-level statistics would overstate precision. The horizon and weight were fixed by inspecting the history block (the sensitivity table shows the neighbourhood), not by an automatic rule. The training set mixes plain A–S logs (history) with A–S + flow logs (test days).
+- Replay: makers never change the tape. So nobody reacts to them; an aggressor that fills a maker still trades everything it traded in the tape (that liquidity is counted twice); and new limit orders priced through a maker's quote don't fill it. The bias was measured on the synthetic market, whose agents react in simple, known ways. Real traders react differently, so the AAPL replay's bias is unmeasured.
+- AAPL: one stock-day, and its 11 half-hour blocks aren't independent, so the standard errors are rough. Each block starts flat and is marked at its end, with no cost for flattening. There is no latency beyond the 100 ms decision clock, and γ, the horizon and the weight were carried over untuned.
 - Walk-forward across independent synthetic sessions rules out look-ahead, but the market never changes regime, so it can't test whether the model goes stale. The AAPL replay (step 5) splits one real day instead.
 - Synthetic market: the noise traders know nothing and the informed traders know everything. There are no momentum traders, no news jumps, and no other market makers yet. The fair value is GBM with constant volatility. The parameters were chosen for a sensible book, not fitted to a real stock.
 - Analytics: the windows count quote updates, not time. Time windows (the last 10 s, say) aren't built yet. The real-data check covers one stock-day and one tick size. The OFI regression pools the whole day. The queue tracker counts the replay's anonymous blocks (orders that rested before the open or outside the visible levels) as single orders.

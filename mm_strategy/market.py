@@ -31,6 +31,7 @@ from dataclasses import dataclass, field
 import numpy as np
 
 from mc_engine import gbm
+from mm_strategy.tape import TapeRecorder
 from orderbook import ArrayOrderBook, OrderType, Side, Trade
 from orderbook.analytics import DepthProfile, OrderFlowImbalance, SpreadDistribution
 
@@ -98,6 +99,7 @@ class Session:
     ofi: OrderFlowImbalance
     digest: int  # FNV-1a of the book's whole event stream
     calls: dict = field(default_factory=dict)  # engine calls by agent
+    tape: object = None  # tape.Tape of LOBSTER messages, if simulate(record_tape=True)
 
     def fair_value_at(self, ts: np.ndarray | int) -> np.ndarray:
         step = self.params.fv_step_ms * 1_000_000
@@ -133,19 +135,20 @@ def fair_value_path(p: MarketParams, rng: np.random.Generator) -> np.ndarray:
     return path * DOLLAR
 
 
-def simulate(p: MarketParams, seed: int, participant=None) -> Session:
+def simulate(p: MarketParams, seed: int, participant=None, record_tape: bool = False) -> Session:
     """Runs one session. `participant`, if given, is driven by the same event loop (the market
     maker of step 2 onwards). It gets `on_start(sim)`, then `on_event(sim, payload)` for each
     event it scheduled through `sim.schedule(t, sim.PARTICIPANT, payload)`, and
-    `on_fill(sim, trade)` for every trade with one of its own (MAKER) orders in it."""
-    return _Simulator(p, seed, participant).run()
+    `on_fill(sim, trade)` for every trade with one of its own (MAKER) orders in it.
+    record_tape=True also writes the session out as LOBSTER messages (Session.tape; step 5)."""
+    return _Simulator(p, seed, participant, record_tape).run()
 
 
 class _Simulator:
     # Event kinds, in tie-break order at equal times (cancels before new arrivals).
     CANCEL, LIMIT, MARKET, INFORMED_ARRIVAL, PARTICIPANT = range(5)
 
-    def __init__(self, p: MarketParams, seed: int, participant) -> None:
+    def __init__(self, p: MarketParams, seed: int, participant, record_tape: bool = False) -> None:
         self.p = p
         self.seed = seed
         ss = np.random.SeedSequence(seed)
@@ -170,6 +173,7 @@ class _Simulator:
         self.trades: list[tuple[int, int, int, int, int, int]] = []
         self.now = 0
         self.participant = participant
+        self.recorder = TapeRecorder() if record_tape else None
 
     # ---- scheduling
 
@@ -197,7 +201,10 @@ class _Simulator:
         participant about the ones it was in."""
         self.calls[agent] += 1
         r = fn(*args)
-        for e in self.book.take_events():
+        events = self.book.take_events()
+        if self.recorder is not None:
+            self.recorder.record(events, self.book)
+        for e in events:
             if isinstance(e, Trade):
                 side = 1 if e.taker_side == Side.Buy else -1
                 self.trades.append((e.ts, e.price, e.qty, side, e.taker, e.maker))
@@ -286,4 +293,5 @@ class _Simulator:
             params=p, seed=self.seed, fair_value=self.fv, trades=trades,
             quotes=self.ofi.records(), spread=self.spread, depth=self.depth, ofi=self.ofi,
             digest=self.book.digest, calls={AGENT_NAMES[a]: n for a, n in self.calls.items()},
+            tape=self.recorder.tape() if self.recorder is not None else None,
         )
