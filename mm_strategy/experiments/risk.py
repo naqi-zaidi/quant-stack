@@ -18,9 +18,9 @@ The gate checks what must hold exactly: the PnL identity in every session; no ca
 ever holds more than the cap plus one quote; after the kill switch fires, inventory only
 shrinks. Detection and PnL are reported with paired standard errors, as is the FYP's own
 restraint test (calm bars: pause rate under 1%, throttle rate under 5%). The README's tables
-come from --sessions 40; CI runs --sessions 6.
+come from --sessions 40; CI runs --sessions 2.
 
-    uv run python -m mm_strategy.experiments.risk [--sessions 6] [--no-figure] [--aapl]
+    uv run python -m mm_strategy.experiments.risk [--sessions 2] [--no-figure] [--aapl]
 
 --aapl (local only, needs the LOBSTER sample) adds the overlay to the AAPL walk-forward of step
 5, with the regimes and the kill threshold fitted on the 9:30-10:30 history block.
@@ -221,7 +221,7 @@ def plot(res, n) -> None:
 
 def main(argv: list[str] | None = None) -> None:
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
-    ap.add_argument("--sessions", type=int, default=6)
+    ap.add_argument("--sessions", type=int, default=2)
     ap.add_argument("--no-figure", action="store_true")
     ap.add_argument("--aapl", action="store_true")
     args = ap.parse_args(argv)

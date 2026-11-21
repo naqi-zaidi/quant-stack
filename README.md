@@ -7,7 +7,8 @@
 
 **One market-making research system rather than three separate demos.** A Monte Carlo engine simulates a hidden fair value. Agents send orders around it into a C++20 limit order book. A market maker quotes into that book through a risk layer, and analytics score the result.
 
-> **Status:** Foundation done. **Project 1 (Monte Carlo engine) and Project 2 (C++20 limit order book) are complete.** **Project 3, the market maker, is under way.**
+> **Status:** Foundation done. **Projects 1, 2 and 3 are complete:** a Monte Carlo engine, a C++20 limit order book, and a market maker evaluated walk-forward on synthetic and real data. The Phase 4 add-ons come next.
+> - **Project 3, step 7 (head-to-head, the Phase 3 gate):** six strategies in four environments, from one command, walk-forward and net of fees. A–S + flow is the only strategy profitable at 4σ: $249 ± 29 an hour live on the synthetic market, $276 ± 23 with the risk overlay, and profitable when replayed as well. It doesn't survive a hidden stress episode (−$20 ± 31) or Nasdaq's AAPL day, where every strategy loses money. Inventory skew cuts PnL risk at least five-fold in both the synthetic market and on AAPL.
 > - **Project 3, step 6 (risk overlay from my FYP):** the FYP's regime detector, anomaly scorer and Allow/Throttle/Pause state machine, ported with its frozen parameters and checked against the FYP's own code on 9,000 decisions, plus an inventory cap and a drawdown kill switch. The synthetic market gains hidden 5-minute stress episodes. The FYP policy flags every episode (median 11 s), but it covers only 17% of each episode's bars and throttles 11.6% of calm bars, failing its own 5% restraint test. The overlay matters most where inventory is otherwise uncontrolled. For a fixed spread under stress, it caps the position at about 600 shares (from 2,000), halves the worst drawdown and recovers $755 ± 182 an hour. For A–S + flow, which already controls its inventory, it adds +$38 ± 18. On AAPL it trims the losses by $67–83 an hour, but they remain.
 > - **Project 3, step 5 (historical replay):** makers trade a replayed tape with virtual orders that wait their turn in the queue. The replay was measured first on the synthetic market, where the same strategy can also trade live. It shows a strategy exactly the live market (every decision of all 40 sessions), keeps the four strategies in the same order, and is at most $135 ± 26 an hour too optimistic. On Nasdaq's AAPL day, walk-forward over 11 half-hour blocks, nothing makes money. A–S loses $1,099 ± 159 an hour and loses in every block. The flow signal's forecast falls to R² 0.4% (from 3.6%) and doesn't change the PnL (−$25 ± 38). On AAPL, past order flow predicts continuation.
 > - **Project 3, step 4 (order-flow signal, walk-forward):** three features of the book predict the mid's next 5 seconds out of sample (R² 3.6% ± 0.15 against no change, above zero on all 40 test days). Moving Avellaneda–Stoikov's reservation price by the prediction turns −$87 ± 30 an hour into **+$249 ± 29**, net of fees, and beats plain A–S in all 40 paired sessions (+$336 ± 18, t = 19). The whole gain is inventory PnL: fills against informed and noise traders both improve by about a third of a tick. Order-flow imbalance on its own predicts reversal here, not continuation.
@@ -34,6 +35,66 @@
 
 ## Results so far
 
+### Market maker: head-to-head, and the Phase 3 gate (Project 3, step 7)
+
+**Every strategy in every environment, from one command** ([`experiments/head_to_head.py`](mm_strategy/experiments/head_to_head.py)): `uv run python -m mm_strategy.experiments.head_to_head --sessions 40 --aapl` (about 22 minutes). The AAPL column needs the LOBSTER sample, so CI runs 2 seeds without it.
+
+Six strategies, each quoting 100 shares a side, with the maker rebate in every PnL:
+- fixed spreads of 1 and 3 ticks;
+- join the best (quote at the best bid and ask);
+- A–S (γ = 3e−4);
+- A–S + flow (step 4's signal);
+- A–S + flow with step 6's risk overlay.
+
+Four environments:
+- **synthetic, live:** seeds 1–40;
+- **synthetic, replayed:** the same seeds, replayed with queue-aware virtual orders;
+- **synthetic, stressed:** the same seeds, each with a hidden stress episode;
+- **AAPL, replayed:** Nasdaq's AAPL day, in 11 half-hour blocks.
+
+Nothing is scored on data it was fitted on:
+- On the synthetic market, σ, k, the regimes and the kill threshold come from the history block, and each environment keeps its own walk-forward chain for the flow model.
+- On AAPL, σ, k and the flow model are refitted before every block.
+
+The gate checks what must hold exactly: the PnL identity, every walk-forward refit, the replay's fidelity, the overlay's limits, and the AAPL replay against LOBSTER.
+
+| Net PnL ($/hour) | synthetic, live | synthetic, replayed | synthetic, stressed | AAPL, replayed |
+|---|---:|---:|---:|---:|
+| fixed 1 tick | −961 ± 184 | −1,098 ± 158 | −1,927 ± 200 | −3,219 ± 1,232 |
+| fixed 3 ticks | −160 ± 149 | −107 ± 161 | −575 ± 194 | −1,302 ± 1,086 |
+| join the best | −1,859 ± 171 | −1,351 ± 175 | −2,536 ± 173 | −727 ± 1,106 |
+| A–S | −87 ± 30 | −28 ± 32 | −471 ± 30 | −1,099 ± 159 |
+| A–S + flow | **+249 ± 29** | **+442 ± 26** | −93 ± 34 | −1,124 ± 163 |
+| A–S + flow + overlay | **+276 ± 23** | **+441 ± 21** | −20 ± 31 | −1,041 ± 165 |
+
+Bold: above zero at 4 standard errors. The AAPL errors are across 11 blocks of one day.
+
+| PnL s.d. across sessions / mean max drawdown ($) | synthetic, live | synthetic, replayed | synthetic, stressed | AAPL, replayed |
+|---|---:|---:|---:|---:|
+| fixed 1 tick | 1,161 / 1,675 | 999 / 1,796 | 1,262 / 2,590 | 4,087 / 2,665 |
+| fixed 3 ticks | 940 / 1,271 | 1,021 / 1,134 | 1,227 / 1,814 | 3,603 / 2,155 |
+| join the best | 1,081 / 2,239 | 1,106 / 1,979 | 1,094 / 2,944 | 3,669 / 1,785 |
+| A–S | 187 / 246 | 201 / 237 | 187 / 595 | 526 / 664 |
+| A–S + flow | 184 / 164 | 165 / 145 | 213 / 387 | 540 / 659 |
+| A–S + flow + overlay | 144 / 128 | 130 / 119 | 196 / 331 | 548 / 604 |
+
+| Paired difference ($/hour) | synthetic, live | synthetic, replayed | synthetic, stressed | AAPL, replayed |
+|---|---:|---:|---:|---:|
+| the flow signal: A–S + flow − A–S | +336 ± 18 | +470 ± 21 | +378 ± 20 | −25 ± 38 |
+| the overlay: + overlay − A–S + flow | +26 ± 13 | −1 ± 12 | +74 ± 16 | +83 ± 26 |
+| the skew: A–S − fixed 3 ticks | +73 ± 147 | +78 ± 150 | +104 ± 191 | +203 ± 1,095 |
+
+Step 6 used one flow model fitted on the history block; here each environment refits it walk-forward, so the stressed figures differ a little from step 6's tables. The other figures match steps 3–6 wherever those ran the same configuration.
+
+![Head-to-head](docs/figures/p3_head_to_head.png)
+
+**The Phase 3 gate: walk-forward, out of sample, net of fees.**
+- **Met on the calm synthetic market.** A–S + flow makes $249 ± 29 an hour live (t = 8.6), and $276 ± 23 with the overlay (t = 12). Replayed, both are profitable too, but $165–193 an hour more so: that's the replay's blind spot, which step 5 measured.
+- **Not met under stress.** During a hidden 5-minute episode, every strategy loses money. The best, A–S + flow + overlay, makes −$20 ± 31, indistinguishable from zero; the overlay is worth $74 ± 16 an hour there.
+- **Not met on AAPL.** Every strategy loses money. The highest mean, join the best's −$727 ± 1,106, is too noisy to call. The flow signal adds nothing (−$25 ± 38), and the overlay trims A–S + flow's loss by $83 ± 26.
+- **What carries over is the inventory skew's control of risk.** A–S's PnL standard deviation is at least five times smaller than any fixed spread's, both on the synthetic market (187 vs 940–1,161) and on AAPL (526 vs 3,603–4,087). Its effect on mean PnL against the 3-tick spread is within noise in every environment.
+- **What doesn't carry over is the edge.** The flow signal's gain is large and steady on the synthetic market (+$336 to +$470, t ≥ 18) and absent on AAPL. The synthetic market's informed traders are a simple model, and the signal was fitted to that market.
+
 ### Market maker: my FYP's risk controller as an overlay (Project 3, step 6)
 
 **The port** ([`mm_strategy/risk.py`](mm_strategy/risk.py)). My final-year project, [fyp-trading-risk-guardrails](https://github.com/naqi-zaidi/fyp-trading-risk-guardrails), is a real-time risk controller for a directional EUR/USD strategy in MetaTrader 5. On each one-minute bar it labels the volatility regime and scores anomalies, and a state machine decides Allow, Throttle, Pause or Hedge. The port keeps its frozen parameters and runs on 5-second bars of the maker's own view of the mid:
@@ -53,7 +114,7 @@ Three parts of the FYP are left out: the Isolation Forest (advisory in the FYP),
 **Tested on the synthetic market with known stress** ([`experiments/risk.py`](mm_strategy/experiments/risk.py)). The market of steps 1–5 has constant volatility, so step 6 adds an optional stress episode: for 5 minutes the fair value's volatility triples and informed traders arrive three times as often. It's off by default, so every earlier digest and result is unchanged.
 - Each of 40 seeds runs twice: calm, and with one episode at a random time between minutes 10 and 50. The strategy isn't told.
 - The regimes, the flow model and the kill threshold all come from the calm history block. The threshold is $1,653, twice plain A–S's largest drawdown there.
-- Run with `uv run python -m mm_strategy.experiments.risk --sessions 40` (about 15 minutes); CI runs 4.
+- Run with `uv run python -m mm_strategy.experiments.risk --sessions 40` (about 15 minutes); CI runs 2.
 - The gate checks only what must hold exactly: the PnL identity; that no capped maker holds more than 500 shares plus one quote; and that inventory only shrinks after the kill switch fires.
 
 | Detection (A–S + flow, policy only) | Value |
@@ -999,7 +1060,7 @@ flowchart TB
 | 0 · Foundation | Monorepo, CMake + uv, CI with ASan/UBSan, LOBSTER loader | CI green | ✅ done |
 | 1 · Monte Carlo engine | Pricer with error bars ✅ → variance reduction ✅ → Greeks ✅ → Asian/barrier/American (Longstaff–Schwartz) ✅ → Merton + Heston ✅ → SPY calibration ✅ → Numba ✅ | MC within its standard error of Black–Scholes | ✅ done |
 | 2 · Limit order book | Matching engine ✅ → property tests ✅ → LOBSTER replay ✅ → snapshot tests + pinned digests ✅ → benchmarks ✅ → pybind11 module ✅ → microstructure analytics ✅ | Rebuilt book matches LOBSTER on every event ✅ (AAPL: 400,390 events, 0 mismatches) | ✅ done |
-| 3 · Market maker | Synthetic market ✅ → harness, PnL split, markouts ✅ → Avellaneda–Stoikov ✅ → order-flow signal (walk-forward) ✅ → historical replay, with the replay's blind spot measured ✅ → FYP risk overlay ✅ → head-to-head | Walk-forward, out-of-sample, net of fees | 🔨 in progress |
+| 3 · Market maker | Synthetic market ✅ → harness, PnL split, markouts ✅ → Avellaneda–Stoikov ✅ → order-flow signal (walk-forward) ✅ → historical replay, with the replay's blind spot measured ✅ → FYP risk overlay ✅ → head-to-head ✅ | Walk-forward, out-of-sample, net of fees ✅ (met on the calm synthetic market; not under stress or on AAPL) | ✅ done |
 | 4 · Add-ons | Delta-hedging PnL simulator, Almgren–Chriss execution on the book | — | ⏳ |
 
 ## Quickstart
@@ -1149,7 +1210,7 @@ quant-stack/
     experiments/      one gate per step (market.py: step 1, harness.py: step 2,
                       avellaneda.py: step 3, flow.py: step 4, blind_spot.py: step 5 in CI,
                       aapl.py: step 5 on the AAPL day, local only, risk.py: step 6, with
-                      risk_aapl.py for its AAPL half)
+                      risk_aapl.py for its AAPL half, head_to_head.py: step 7)
   marketdata/         loaders: LOBSTER, option-chain snapshots → implied-vol surface
   tests/              pytest + Hypothesis property tests; data/ holds the FYP traces that
                       the risk overlay must reproduce (make_fyp_traces.py regenerates them)
@@ -1183,6 +1244,7 @@ quant-stack/
 - Avellaneda–Stoikov is calibrated once, on separate sessions, and held fixed. σ is estimated at 60-second sampling, which still sits 2.4 s.e. above the true value. The finite-horizon formulas make the skew strongest at the open, so this session-long horizon is a modelling choice.
 - Market maker: PnL is marked to the closing mid, without the cost of flattening the position. Decisions come on a fixed 100 ms clock, with no reaction to individual book events, and the quote size ignores queue position. Fees are illustrative, not one exchange's schedule.
 - Order-flow signal: linear in three features, scored on decisions every 100 ms with overlapping 5-second targets. Standard errors come from session-to-session variation, which is valid because sessions are independent; row-level statistics would overstate precision. The horizon and weight were fixed by inspecting the history block (the sensitivity table shows the neighbourhood), not by an automatic rule. The training set mixes plain A–S logs (history) with A–S + flow logs (test days).
+- Head-to-head: four environments, but only one real stock-day. The edge holds only in the calm synthetic market, so nothing here is evidence of a strategy that would make money on a real exchange.
 - Risk overlay: the bar length (5 s instead of the FYP's one minute) is the one parameter changed; everything counted in bars keeps the FYP's value. The stress episode has one shape (5 minutes, volatility and informed flow ×3), so the detection figures describe that shape, not real regime changes. The cap is a round number and the kill threshold a rule applied to the history block; neither was optimised.
 - Replay: makers never change the tape. So nobody reacts to them; an aggressor that fills a maker still trades everything it traded in the tape (that liquidity is counted twice); and new limit orders priced through a maker's quote don't fill it. The bias was measured on the synthetic market, whose agents react in simple, known ways. Real traders react differently, so the AAPL replay's bias is unmeasured.
 - AAPL: one stock-day, and its 11 half-hour blocks aren't independent, so the standard errors are rough. Each block starts flat and is marked at its end, with no cost for flattening. There is no latency beyond the 100 ms decision clock, and γ, the horizon and the weight were carried over untuned.
