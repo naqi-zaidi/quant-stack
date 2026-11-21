@@ -50,6 +50,8 @@ jobs:
         run: uv run python -m orderbook.microstructure --no-figure
       - name: Project 3 step 1 gate (synthetic market reproducible; prices follow fair value; adverse selection at 4σ)
         run: uv run python -m mm_strategy.experiments.market --no-figure
+      - name: Project 3 step 2 gate (maker's books reconcile with the engine; PnL identity exact; never takes liquidity)
+        run: uv run python -m mm_strategy.experiments.harness --no-figure
 
   cpp:
     name: C++ (${{ matrix.preset }})

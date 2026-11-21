@@ -135,8 +135,9 @@ def fair_value_path(p: MarketParams, rng: np.random.Generator) -> np.ndarray:
 
 def simulate(p: MarketParams, seed: int, participant=None) -> Session:
     """Runs one session. `participant`, if given, is driven by the same event loop (the market
-    maker of step 2 onwards); it is called with `on_start(sim)` and must schedule its own
-    events through `sim.schedule`."""
+    maker of step 2 onwards). It gets `on_start(sim)`, then `on_event(sim, payload)` for each
+    event it scheduled through `sim.schedule(t, sim.PARTICIPANT, payload)`, and
+    `on_fill(sim, trade)` for every trade with one of its own (MAKER) orders in it."""
     return _Simulator(p, seed, participant).run()
 
 
@@ -192,13 +193,17 @@ class _Simulator:
         return order_id(agent, self.counter[agent])
 
     def call(self, agent: int, fn, *args):
-        """One engine call on behalf of `agent`; records the trades it caused."""
+        """One engine call on behalf of `agent`; records the trades it caused and tells the
+        participant about the ones it was in."""
         self.calls[agent] += 1
         r = fn(*args)
         for e in self.book.take_events():
             if isinstance(e, Trade):
                 side = 1 if e.taker_side == Side.Buy else -1
                 self.trades.append((e.ts, e.price, e.qty, side, e.taker, e.maker))
+                if self.participant is not None and MAKER in (agent_of(e.maker),
+                                                              agent_of(e.taker)):
+                    self.participant.on_fill(self, e)
         return r
 
     # ---- agents
