@@ -7,7 +7,8 @@
 
 **One market-making research system rather than three separate demos.** A Monte Carlo engine simulates a hidden fair value. Agents send orders around it into a C++20 limit order book. A market maker quotes into that book through a risk layer, and analytics score the result.
 
-> **Status:** Foundation done. **Project 1 (Monte Carlo engine) is complete.** **Phase 2, the C++20 limit order book, is under way.**
+> **Status:** Foundation done. **Project 1 (Monte Carlo engine) and Project 2 (C++20 limit order book) are complete.** Project 3, the market maker, is next.
+> - **Project 2, step 6 (microstructure analytics):** spread distribution, depth profile, order-flow imbalance and queue positions, each a C++ listener that rebuilds its own view of the book from the event stream alone. On the AAPL day, all of them match the same statistics computed directly from LOBSTER's own book file, exactly. Order-flow imbalance explains 41% of 10-second price moves (95% CI 33–51%).
 > - **Project 2, step 5 (Python module):** `uv sync` builds the engine into a Python package, `orderbook`. From Python, it reproduces all ten C++ golden transcripts byte for byte and hashes to the pinned C++ digests. Replaying the AAPL day from Python gives 0 mismatches and the same 1,283,305-event digest as the C++ replay. A call costs about 0.3 µs from Python.
 > - **Project 2, step 4 (benchmarks):** a tick-indexed array of price levels makes the steady-state hot path allocation-free, closes a level 4.0× faster than an ordered map (31 vs 122 ns) and opens one 1.6× faster. On real AAPL flow, a delete takes about 40% less time at the median. It reproduces every golden transcript and pinned digest from step 3.5 byte for byte.
 > - **Project 2, step 3.5 (snapshot tests, pinned digests):** ten golden-file scenarios print the whole book and every event, and the event stream's FNV-1a digest is pinned for 18 fixed flows. Both are fixed before the level structure changes in step 4, which must reproduce them byte for byte.
@@ -26,6 +27,72 @@
 > CI runs a gate for every step.
 
 ## Results so far
+
+### Limit order book: microstructure analytics (Project 2, step 6)
+
+**Four analytics that never read the book.** Each one is a C++ `Listener` ([`lob/analytics.hpp`](lob/include/lob/analytics.hpp)):
+- event handlers rebuild what it needs from the event stream (an L2 mirror from level updates, or an L3 mirror from execution reports);
+- eval functions compute values on demand.
+
+So the same code runs on a live book, a LOBSTER replay, or Project 3's simulation. This is the handler/eval split of Jane Street's [Flex Model](https://blog.janestreet.com/flex-model-an-event-driven-feature-engineering-system/).
+
+| Analytic | What it keeps | What it answers |
+|---|---|---|
+| `SpreadDistribution` | L2 mirror, ns spent at each spread | time-weighted distribution and mean of the spread, in ticks |
+| `DepthProfile` | L2 mirror, Σ size × ns at 0..K−1 ticks from each best | mean resting size by distance from the best price |
+| `OrderFlowImbalance` | best quotes, a ring buffer of the last N contributions with a running sum | e_n at every change of the best quotes ([Cont, Kukanov and Stoikov 2014](https://arxiv.org/abs/1011.6402)), OFI over the last N updates, cumulative OFI, queue imbalance |
+| `QueuePositions` | L3 mirror (FIFO per price) | orders and shares ahead of any resting order; history for tracked orders |
+
+Time-weighted statistics charge each state for the time it lasted. A state that exists only inside one timestamp, such as the moment an aggressive order sits in its level before trading, is charged nothing. From Python, attach a listener before the first event:
+
+```python
+from orderbook import lobster
+from orderbook.analytics import OrderFlowImbalance, SpreadDistribution
+
+rp = lobster.ArrayReplay(levels=10, tick=100)
+spread, ofi = SpreadDistribution(tick_size=100), OrderFlowImbalance(window=100, record=True)
+rp.attach(spread)
+rp.attach(ofi)
+rp.run("data/AAPL_2012-06-21_34200000_57600000_message_10.csv")
+spread.histogram(now=57_600_000_000_000)  # [(spread in cents, ns at that spread), ...]
+ofi.records()                              # every quote update as numpy columns
+```
+
+**Checked against brute force** (C++ GoogleTest plus the Python gate, `uv run python -m orderbook.microstructure`, both in CI). Both books run the five property-test regimes. After every call, every statistic is recomputed from the book's own views and must match exactly:
+- the mirrored L2 and L3 books;
+- the time-weighted spread and depth sums;
+- every resting order's queue position (157,668 checks per book in the Python gate);
+- the tracked histories;
+- every e_n, with the formula written out a second time, case by case;
+- the last-N window and the total.
+
+Five planted bugs in the analytics are all caught. One of them, a partial fill that didn't mark its queue for re-recording, is caught only by the differential test, not by the hand-computed cases. The tests also pass under ASan/UBSan.
+
+**Checked against Nasdaq's own book** (local only). The AAPL day is replayed with all four analytics attached, and each statistic is recomputed straight from LOBSTER's orderbook file, independently of the engine:
+
+| Statistic | From the engine's events | From LOBSTER's file |
+|---|---|---|
+| Spread, time-weighted over 23,400 s | mean 15.1¢, median 15¢; between 8¢ and 23¢ 80% of the time; most often 13¢ (7.2% of the time) | identical |
+| Depth at 0–9 cents from the best (mean shares), bids | 169, 63, 57, 56, 49, 60, 67, 69, 65, 71 | identical |
+| Depth at 0–9 cents from the best (mean shares), asks | 138, 48, 46, 47, 48, 49, 59, 56, 65, 66 | identical |
+| Cumulative OFI | −218,913 shares over 107,164 quote updates | −218,913 over 107,164 quote changes |
+| Queue positions (25,043 orders at 80 checkpoints) | from the L3 mirror | identical to the replayed book's own L3 view |
+
+Ten levels cover every price within 9 cents of the best, so the depth comparison is exact. Each LOBSTER message changes at most one level, so the engine's quote updates line up one for one with the file's, and both OFI totals are sums of the same terms.
+
+![AAPL microstructure](docs/figures/aapl_microstructure.png)
+
+**Order-flow imbalance and price moves.** Over 2,339 ten-second intervals, the mid-price change is regressed on OFI:
+
+| Slope (¢ per 1,000 shares) | HC1 s.e. | R² | R² 95% bootstrap | 1/(2 × slope) | Mean depth at the best |
+|---:|---:|---:|---|---:|---:|
+| 4.11 | 0.44 | 0.41 | 0.33–0.51 | 122 shares | 154 shares |
+
+In Cont, Kukanov and Stoikov's stylised model, the price moves one tick for every 2D shares of imbalance, where D is the depth at each level. So 1/(2 × slope) estimates D: 122 shares, against 154 measured at the best on the same day. This is one pooled regression over a whole day, while depth varies within it; the paper fits separate half-hour windows.
+
+**Queue positions.** 513 orders that joined the queue at the best price were sampled through the day and tracked: 104 filled and 409 were cancelled. A median order joined with 100 shares ahead of it, and the filled ones took a median of 1.0 s to fill. Under FIFO, every filled order's queue drained to zero first (figure, bottom right).
+
+**Cost.** All four analytics together add 0.36 s [0.34–0.40] to the 0.65 s whole-day replay in C++, about 280 ns per book event (median [min–max] of 5 interleaved runs). Nothing changes inside the engine: all goldens and pinned digests are unchanged.
 
 ### Limit order book: Python module (Project 2, step 5)
 
@@ -596,7 +663,7 @@ flowchart TB
 |---|---|---|---|
 | 0 · Foundation | Monorepo, CMake + uv, CI with ASan/UBSan, LOBSTER loader | CI green | ✅ done |
 | 1 · Monte Carlo engine | Pricer with error bars ✅ → variance reduction ✅ → Greeks ✅ → Asian/barrier/American (Longstaff–Schwartz) ✅ → Merton + Heston ✅ → SPY calibration ✅ → Numba ✅ | MC within its standard error of Black–Scholes | ✅ done |
-| 2 · Limit order book | Matching engine ✅ → property tests ✅ → LOBSTER replay ✅ → snapshot tests + pinned digests ✅ → benchmarks ✅ → pybind11 module ✅ → microstructure analytics | Rebuilt book matches LOBSTER on every event ✅ (AAPL: 400,390 events, 0 mismatches) | 🔨 in progress |
+| 2 · Limit order book | Matching engine ✅ → property tests ✅ → LOBSTER replay ✅ → snapshot tests + pinned digests ✅ → benchmarks ✅ → pybind11 module ✅ → microstructure analytics ✅ | Rebuilt book matches LOBSTER on every event ✅ (AAPL: 400,390 events, 0 mismatches) | ✅ done |
 | 3 · Market maker | Avellaneda–Stoikov, order-flow-imbalance skew, markouts, risk overlay | Walk-forward, out-of-sample, net of fees | ⏳ |
 | 4 · Add-ons | Delta-hedging PnL simulator, Almgren–Chriss execution on the book | — | ⏳ |
 
@@ -618,6 +685,7 @@ uv run python -m mc_engine.experiments.models              # step 5 tables + fig
 uv run python -m mc_engine.experiments.calibration         # step 6: Heston fit to SPY (~20 s)
 uv run python -m mc_engine.experiments.speed               # step 7: NumPy vs Numba throughput (~30 s)
 uv run python -m orderbook.gate                            # Phase 2 step 5: Python module gate (~10 s)
+uv run python -m orderbook.microstructure                  # Phase 2 step 6: analytics gate + figure (~15 s)
 ```
 
 C++ core (needs CMake ≥ 3.25 and a C++20 compiler):
@@ -721,9 +789,11 @@ quant-stack/
                       fast Heston surface pricer + calibration, Numba kernels (fast.py)
     experiments/      scripts that produce every number in this README
   lob/                Project 2: C++20 matching engine (order_book) over map or array price
-                      levels (levels), id map, object pool, event stream, LOBSTER replay
+                      levels (levels), id map, object pool, event stream, LOBSTER replay,
+                      microstructure analytics as event listeners (analytics)
     python/           pybind11 bindings (bindings.cpp) and the `orderbook` package:
-                      lobster replay, text formatter, step 5 gate (gate.py)
+                      lobster replay, analytics, text formatter, step 5 gate (gate.py),
+                      step 6 gate + figure (microstructure.py)
     tools/            lob_replay (step 3 gate), lob_latency (step 4, real-flow latency)
     bench/            lob_bench: Google Benchmark microbenchmarks, map vs array
     tests/            GoogleTest suite, reference model, property harness + shrinker,
@@ -759,6 +829,7 @@ quant-stack/
 - Order book: single-threaded, no self-trade prevention, no hidden or iceberg orders. Post-only orders are rejected rather than re-priced when they would cross.
 - LOBSTER replay: validated on one stock-day. More LOBSTER sample days (MSFT, for example) would broaden it. The real-data gate runs locally, not in CI, because the sample can't be redistributed.
 - Order book tests: the reference model and the engine share an author, so a misreading of the matching rules common to both would pass the comparison. The planted bugs show the checks can catch errors; they don't prove the rules match an exchange's. Step 3's replay against real Nasdaq data is that outside check.
+- Analytics: the windows count quote updates, not time. Time windows (the last 10 s, say) aren't built yet. The real-data check covers one stock-day and one tick size. The OFI regression pools the whole day. The queue tracker counts the replay's anonymous blocks (orders that rested before the open or outside the visible levels) as single orders.
 - Python module: crossing into C++ costs about 0.3 µs a call, so a strategy that sends millions of orders spends most of its engine time on the boundary. A batch call taking arrays would amortise it; it isn't built. Each book or replay belongs to one thread.
 - `uv sync` now compiles C++, so a fresh clone needs a compiler and CMake as well as uv. CI builds and tests the module on Linux only.
 - Order book: if memory runs out while opening a new level, the book stays internally consistent but drops that order's unfilled remainder. Sizing the pool and id map up front keeps every other allocation off the trading path.

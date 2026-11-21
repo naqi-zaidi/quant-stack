@@ -11,6 +11,7 @@ add_executable(lob_tests
   test_golden.cpp
   test_digest.cpp
   test_levels.cpp
+  test_analytics.cpp
 )
 target_link_libraries(lob_tests PRIVATE lob::core qs_options GTest::gtest_main)
 # Snapshot tests read and (with UPDATE_GOLDEN=1) write lob/tests/golden/*.txt.

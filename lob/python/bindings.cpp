@@ -8,6 +8,8 @@
 //   Result, LevelView, OrderView    what calls and views return  } made in C++
 //   lobster.Replay, ArrayReplay     LOBSTER replay, one event at a time or a whole day in C++
 //   lobster.DayReader, Message, Snapshot, ReplayStats, ...
+//   analytics.SpreadDistribution, DepthProfile, OrderFlowImbalance, QueuePositions
+//                                   listeners attached to a book or replay with attach()
 //
 // Prices cross the boundary as integer ticks (Python int), never floats. Events stay in a C++
 // vector until take_events() copies them out, and the FNV-1a digest (digest.hpp) folds in
@@ -24,6 +26,7 @@
 // instance (which heap-copies the value and registers it), so a call returning a Result costs
 // ~100 ns less.
 
+#include <pybind11/numpy.h>
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 
@@ -32,14 +35,17 @@
 #include <cstddef>
 #include <cstdint>
 #include <initializer_list>
+#include <limits>
 #include <optional>
 #include <sstream>
+#include <tuple>
 #include <stdexcept>
 #include <string>
 #include <utility>
 #include <variant>
 #include <vector>
 
+#include "lob/analytics.hpp"
 #include "lob/digest.hpp"
 #include "lob/events.hpp"
 #include "lob/lobster.hpp"
@@ -170,6 +176,17 @@ py::handle to_py(const Result& r) {
 py::handle to_py(const LevelView& v) {
   return make_seq<LevelView, 3>({to_py_int(v.price.ticks), to_py_int(v.qty), to_py_uint(v.count)});
 }
+PyObject* to_py_price(const std::optional<Price>& p) {
+  if (!p) Py_RETURN_NONE;
+  return to_py_int(p->ticks);
+}
+py::handle to_py(const analytics::Quote& q) {
+  return make_seq<analytics::Quote, 4>({to_py_price(q.bid), to_py_int(q.bid_qty),
+                                        to_py_price(q.ask), to_py_int(q.ask_qty)});
+}
+py::handle to_py(const analytics::QueuePosition& p) {
+  return make_seq<analytics::QueuePosition, 2>({to_py_uint(p.orders), to_py_int(p.qty)});
+}
 py::handle to_py(const OrderView& o) {
   return make_seq<OrderView, 6>({to_py_uint(o.id), to_py_enum(o.side), to_py_enum(o.type),
                                  to_py_int(o.price.ticks), to_py_int(o.qty), to_py_uint(o.ts)});
@@ -192,6 +209,7 @@ QS_INT_ENUM_CASTER(lob::OrderType, "orderbook.OrderType")
 QS_INT_ENUM_CASTER(lob::ExecType, "orderbook.ExecType")
 QS_INT_ENUM_CASTER(lob::Reason, "orderbook.Reason")
 QS_INT_ENUM_CASTER(lob::lobster::Event, "orderbook.lobster.Event")
+QS_INT_ENUM_CASTER(lob::analytics::QueueStatus, "orderbook.analytics.QueueStatus")
 #undef QS_INT_ENUM_CASTER
 
 // Output-only: Python never passes these back in.
@@ -210,6 +228,8 @@ QS_SEQ_CASTER(lob::ExecReport, "orderbook.ExecReport")
 QS_SEQ_CASTER(lob::Result, "orderbook.Result")
 QS_SEQ_CASTER(lob::LevelView, "orderbook.LevelView")
 QS_SEQ_CASTER(lob::OrderView, "orderbook.OrderView")
+QS_SEQ_CASTER(lob::analytics::Quote, "orderbook.analytics.Quote")
+QS_SEQ_CASTER(lob::analytics::QueuePosition, "orderbook.analytics.QueuePosition")
 #undef QS_SEQ_CASTER
 }  // namespace pybind11::detail
 
@@ -226,16 +246,27 @@ class Sink final : public Listener {
     ++count;
     if (hash) digest.on_trade(t);
     if (record) events.emplace_back(t);
+    for (Listener* l : attached) l->on_trade(t);
   }
   void on_level_update(const LevelUpdate& u) override {
     ++count;
     if (hash) digest.on_level_update(u);
     if (record) events.emplace_back(u);
+    for (Listener* l : attached) l->on_level_update(u);
   }
   void on_report(const ExecReport& r) override {
     ++count;
     if (hash) digest.on_report(r);
     if (record) events.emplace_back(r);
+    for (Listener* l : attached) l->on_report(r);
+  }
+  // An analytic rebuilds its view of the book from events, so it must see them all.
+  void attach(Listener& l) {
+    if (count != 0) {
+      throw std::runtime_error("attach() listeners before the first event: this one has seen " +
+                               std::to_string(count));
+    }
+    attached.push_back(&l);
   }
   std::vector<Event> take() { return std::exchange(events, {}); }
   [[nodiscard]] std::optional<std::uint64_t> value() const {
@@ -244,6 +275,7 @@ class Sink final : public Listener {
 
   EventDigest digest;
   std::vector<Event> events;
+  std::vector<Listener*> attached;
   std::size_t count{0};
   bool hash{true};
   bool record{true};
@@ -420,6 +452,10 @@ void bind_book(py::module_& m, const char* view_name, const char* name, const ch
            "anything else is a cancel-replace.")
       .def("take_events", [](Owned& b) { return b.sink.take(); },
            "Events recorded since the last call, in the order the book emitted them.")
+      .def("attach", [](Owned& b, Listener& l) { b.sink.attach(l); }, py::arg("listener"),
+           py::keep_alive<1, 2>(),
+           "Sends every event to an orderbook.analytics listener as well. Attach before the "
+           "first call; the book keeps the listener alive.")
       .def_property_readonly("digest", [](const Owned& b) { return b.sink.value(); },
                              "FNV-1a 64 digest of every event emitted so far (digest.hpp), or "
                              "None if the book was made with digest_events=False.")
@@ -461,12 +497,186 @@ void bind_replay(py::module_& m, const char* name, const char* what) {
       .def_property_readonly("levels", &R::levels)
       .def("take_events", [](R& r) { return r.sink.take(); },
            "Book events recorded since the last call (record_events must be on).")
+      .def("attach", [](R& r, Listener& l) { r.sink.attach(l); }, py::arg("listener"),
+           py::keep_alive<1, 2>(),
+           "Sends every book event to an orderbook.analytics listener as well, seeding "
+           "included. Attach before seed() or run().")
       .def_property_readonly("digest", [](const R& r) { return r.sink.value(); },
                              "FNV-1a 64 digest of every book event so far (None if off).")
       .def_property_readonly("event_count", [](const R& r) { return r.sink.count; })
       .def_property(
           "record_events", [](const R& r) { return r.sink.record; },
           [](R& r, bool on) { r.sink.record = on; });
+}
+
+template <typename T>
+py::array_t<T> column(std::size_t n) {
+  return py::array_t<T>(static_cast<py::ssize_t>(n));
+}
+
+void bind_analytics(py::module_& am) {
+  using namespace lob::analytics;
+  def_enum<QueueStatus>(am, "QueueStatus", "How a tracked order's history sample came about.",
+                        {{"Resting", QueueStatus::Resting},
+                         {"Filled", QueueStatus::Filled},
+                         {"Cancelled", QueueStatus::Cancelled}});
+  def_seq<Quote>(am, "orderbook.analytics.Quote",
+                 "Best bid and ask with their sizes; a missing side has price None and size 0.",
+                 {{"bid", "ticks or None"}, {"bid_qty", "size"},
+                  {"ask", "ticks or None"}, {"ask_qty", "size"}});
+  def_seq<QueuePosition>(am, "orderbook.analytics.QueuePosition",
+                         "Orders and open size ahead of an order in its queue.",
+                         {{"orders", "orders ahead"}, {"qty", "their open size"}});
+  am.attr("NO_BID") = std::numeric_limits<std::int64_t>::min();
+  am.attr("NO_ASK") = std::numeric_limits<std::int64_t>::max();
+
+  py::class_<Listener>(am, "Listener",
+                       "Base of the analytics: attach one to a book or replay with attach().");
+
+  py::class_<SpreadDistribution, Listener>(
+      am, "SpreadDistribution", "Time-weighted distribution of the bid-ask spread, in ticks.")
+      .def(py::init<std::int64_t>(), py::arg("tick_size") = std::int64_t{1})
+      .def_property_readonly("spread", &SpreadDistribution::spread,
+                             "Current spread in ticks, or None if a side is empty.")
+      .def("histogram", &SpreadDistribution::histogram, py::arg("now"),
+           "(spread in ticks, ns spent there) pairs, ascending, up to `now`.")
+      .def("two_sided_ns", &SpreadDistribution::two_sided_ns, py::arg("now"))
+      .def("one_sided_ns", &SpreadDistribution::one_sided_ns, py::arg("now"))
+      .def("mean", &SpreadDistribution::mean, py::arg("now"),
+           "Time-weighted mean spread in ticks over two-sided time.")
+      .def("elapsed", &SpreadDistribution::elapsed, py::arg("now"))
+      .def("reset", &SpreadDistribution::reset, py::arg("now"),
+           "Restarts the statistics at `now`, keeping the rebuilt book.")
+      .def_property_readonly("quote", &SpreadDistribution::quote)
+      .def_property_readonly("tick_size", &SpreadDistribution::tick_size)
+      .def_property_readonly("overflowed", &SpreadDistribution::overflowed);
+
+  py::class_<DepthProfile, Listener>(
+      am, "DepthProfile",
+      "Time-weighted mean resting size at 0..ticks-1 ticks from each side's best price.")
+      .def(py::init<std::int64_t, std::size_t>(), py::arg("tick_size") = std::int64_t{1},
+           py::arg("ticks") = std::size_t{10})
+      .def("current", &DepthProfile::current, py::arg("side"))
+      .def("sums", &DepthProfile::sums, py::arg("side"), py::arg("now"),
+           "Size x nanoseconds summed over time at each distance.")
+      .def("observed_ns", &DepthProfile::observed_ns, py::arg("side"), py::arg("now"),
+           "Time the side had at least one level.")
+      .def("mean", &DepthProfile::mean, py::arg("side"), py::arg("now"))
+      .def("elapsed", &DepthProfile::elapsed, py::arg("now"))
+      .def("reset", &DepthProfile::reset, py::arg("now"))
+      .def_property_readonly("quote", &DepthProfile::quote)
+      .def_property_readonly("ticks", &DepthProfile::ticks)
+      .def_property_readonly("tick_size", &DepthProfile::tick_size)
+      .def_property_readonly("overflowed", &DepthProfile::overflowed);
+
+  py::class_<OrderFlowImbalance, Listener>(
+      am, "OrderFlowImbalance",
+      "Cont-Kukanov-Stoikov order-flow imbalance: e_n at every change of the best quotes, the "
+      "sum of the last `window`, and the running total.")
+      .def(py::init<std::size_t, bool>(), py::arg("window") = std::size_t{100},
+           py::arg("record") = false)
+      .def_property_readonly("last", &OrderFlowImbalance::last)
+      .def_property_readonly("window_sum", &OrderFlowImbalance::window_sum)
+      .def_property_readonly("window", &OrderFlowImbalance::window)
+      .def_property_readonly("window_count", &OrderFlowImbalance::window_count)
+      .def_property_readonly("total", &OrderFlowImbalance::total)
+      .def_property_readonly("updates", &OrderFlowImbalance::updates)
+      .def_property_readonly("quote", &OrderFlowImbalance::quote)
+      .def_property_readonly("imbalance", &OrderFlowImbalance::imbalance,
+                             "(bid size - ask size) / (bid size + ask size) at the best "
+                             "quotes, or None if a side is empty.")
+      .def("reset", &OrderFlowImbalance::reset)
+      .def(
+          "records",
+          [](const OrderFlowImbalance& o) {
+            const auto& r = o.records();
+            const std::size_t n = r.size();
+            auto ts = column<std::uint64_t>(n);
+            auto bid = column<std::int64_t>(n);
+            auto bq = column<std::int64_t>(n);
+            auto ask = column<std::int64_t>(n);
+            auto aq = column<std::int64_t>(n);
+            auto e = column<std::int64_t>(n);
+            auto* pts = ts.mutable_data();
+            auto* pb = bid.mutable_data();
+            auto* pbq = bq.mutable_data();
+            auto* pa = ask.mutable_data();
+            auto* paq = aq.mutable_data();
+            auto* pe = e.mutable_data();
+            for (std::size_t i = 0; i < n; ++i) {
+              pts[i] = r[i].ts;
+              pb[i] = r[i].quote.bid ? r[i].quote.bid->ticks
+                                     : std::numeric_limits<std::int64_t>::min();
+              pbq[i] = r[i].quote.bid_qty;
+              pa[i] = r[i].quote.ask ? r[i].quote.ask->ticks
+                                     : std::numeric_limits<std::int64_t>::max();
+              paq[i] = r[i].quote.ask_qty;
+              pe[i] = r[i].e;
+            }
+            py::dict d;
+            d["ts"] = ts;
+            d["bid"] = bid;
+            d["bid_qty"] = bq;
+            d["ask"] = ask;
+            d["ask_qty"] = aq;
+            d["e"] = e;
+            return d;
+          },
+          "Every quote update as numpy columns ts, bid, bid_qty, ask, ask_qty, e (record=True). "
+          "A missing bid is NO_BID, a missing ask NO_ASK.");
+
+  py::class_<QueuePositions, Listener>(
+      am, "QueuePositions",
+      "Every resting order's place in its queue, rebuilt from execution reports, with a history "
+      "for tracked orders.")
+      .def(py::init<>())
+      .def("ahead", &QueuePositions::ahead, py::arg("id"),
+           "QueuePosition(orders, qty) ahead of the order, or None if it is not resting.")
+      .def("track", &QueuePositions::track, py::arg("id"),
+           "Record this order's place whenever it changes, from now or from its arrival.")
+      .def("flush", &QueuePositions::flush, "Record pending changes now (end of a run).")
+      .def("reset", &QueuePositions::reset, "Forget the history.")
+      .def_property_readonly("order_count", &QueuePositions::order_count)
+      .def(
+          "orders",
+          [](const QueuePositions& q, Side s) {
+            std::vector<std::tuple<OrderId, std::int64_t, Quantity>> out;
+            for (const auto& o : q.orders(s)) out.emplace_back(o.id, o.price.ticks, o.leaves);
+            return out;
+          },
+          py::arg("side"), "(id, price, open qty) in priority order, as the mirror sees them.")
+      .def(
+          "history",
+          [](QueuePositions& q, bool flush) {
+            if (flush) q.flush();
+            const auto& h = q.history();
+            const std::size_t n = h.size();
+            auto ts = column<std::uint64_t>(n);
+            auto id = column<std::uint64_t>(n);
+            auto oa = column<std::int64_t>(n);
+            auto qa = column<std::int64_t>(n);
+            auto lv = column<std::int64_t>(n);
+            auto st = column<std::uint8_t>(n);
+            for (std::size_t i = 0; i < n; ++i) {
+              ts.mutable_data()[i] = h[i].ts;
+              id.mutable_data()[i] = h[i].id;
+              oa.mutable_data()[i] = static_cast<std::int64_t>(h[i].ahead.orders);
+              qa.mutable_data()[i] = h[i].ahead.qty;
+              lv.mutable_data()[i] = h[i].leaves;
+              st.mutable_data()[i] = static_cast<std::uint8_t>(h[i].status);
+            }
+            py::dict d;
+            d["ts"] = ts;
+            d["id"] = id;
+            d["orders_ahead"] = oa;
+            d["qty_ahead"] = qa;
+            d["leaves"] = lv;
+            d["status"] = st;
+            return d;
+          },
+          py::arg("flush") = true,
+          "Tracked samples as numpy columns ts, id, orders_ahead, qty_ahead, leaves, status "
+          "(a QueueStatus value).");
 }
 
 }  // namespace
@@ -651,4 +861,7 @@ PYBIND11_MODULE(_lob, m) {
 
   bind_replay<OrderBook>(lm, "Replay", "std::map price levels");
   bind_replay<ArrayOrderBook>(lm, "ArrayReplay", "tick-indexed array price levels");
+
+  auto am = m.def_submodule("analytics", "Microstructure analytics computed from book events.");
+  bind_analytics(am);
 }

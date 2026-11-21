@@ -46,6 +46,8 @@ jobs:
         run: uv run python -m mc_engine.experiments.speed
       - name: Phase 2 step 5 gate (Python module reproduces the C++ engine event for event)
         run: uv run python -m orderbook.gate
+      - name: Phase 2 step 6 gate (microstructure analytics match brute-force recomputation)
+        run: uv run python -m orderbook.microstructure --no-figure
 
   cpp:
     name: C++ (${{ matrix.preset }})
