@@ -58,6 +58,8 @@ jobs:
         run: uv run python -m mm_strategy.experiments.flow --sessions 10 --no-figure
       - name: Project 3 step 5 gate (replay shows a strategy exactly the live market; live vs replayed PnL reported)
         run: uv run python -m mm_strategy.experiments.blind_spot --sessions 6 --no-figure
+      - name: Project 3 step 6 gate (FYP risk overlay; inventory cap and kill switch hold exactly)
+        run: uv run python -m mm_strategy.experiments.risk --sessions 4 --no-figure
 
   cpp:
     name: C++ (${{ matrix.preset }})

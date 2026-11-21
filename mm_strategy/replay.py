@@ -166,7 +166,7 @@ class ReplayMaker:
         ask = asks[0][0] if asks else None
         mid = (bid + ask) / 2 if bid is not None and ask is not None else None
         q = self.strategy.quote(MarketView(now, self.end, bid, ask, mid, self.inventory,
-                                           self.tick, bids, asks))
+                                           self.tick, bids, asks, self.cash))
         self._place(book, 1, q.bid, q.bid_size, ask)
         self._place(book, -1, q.ask, q.ask_size, bid)
         self.samples.append((now, self.inventory, self.cash))

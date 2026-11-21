@@ -79,6 +79,13 @@ class MarketParams:
     lot: int = 100
     size_p: float = 0.5
     max_lots: int = 10
+    # A stress episode (step 6): from stress_start_s for stress_len_s seconds the fair value's
+    # volatility is multiplied by stress_vol, and informed traders arrive stress_informed times
+    # as often. Off by default (stress_len_s = 0), which leaves every session as it was.
+    stress_start_s: float = 0.0
+    stress_len_s: float = 0.0
+    stress_vol: float = 1.0
+    stress_informed: float = 1.0
 
     @property
     def duration_ns(self) -> int:
@@ -128,11 +135,19 @@ class _Placement:
 
 
 def fair_value_path(p: MarketParams, rng: np.random.Generator) -> np.ndarray:
-    """GBM fair value in price units on the fv_step_ms grid (Project 1's exact step)."""
+    """GBM fair value in price units on the fv_step_ms grid (Project 1's exact step). During a
+    stress episode the volatility is stress_vol times higher; the step stays exact."""
     n_steps = int(round(p.hours * 3600 * 1000 / p.fv_step_ms))
     years = p.hours / TRADING_YEAR_HOURS
-    path = gbm.paths(p.s0, 0.0, p.sigma, years, n_steps, 1, rng)[0]
-    return path * DOLLAR
+    if p.stress_len_s <= 0 or p.stress_vol == 1.0:
+        path = gbm.paths(p.s0, 0.0, p.sigma, years, n_steps, 1, rng)[0]
+        return path * DOLLAR
+    dt = years / n_steps
+    t = np.arange(n_steps) * p.fv_step_ms / 1000  # start of each step, seconds
+    stressed = (t >= p.stress_start_s) & (t < p.stress_start_s + p.stress_len_s)
+    sig = np.where(stressed, p.sigma * p.stress_vol, p.sigma)
+    steps = -0.5 * sig**2 * dt + sig * np.sqrt(dt) * rng.standard_normal(n_steps)
+    return p.s0 * np.exp(np.r_[0.0, np.cumsum(steps)]) * DOLLAR
 
 
 def simulate(p: MarketParams, seed: int, participant=None, record_tape: bool = False) -> Session:
@@ -241,8 +256,22 @@ class _Simulator:
                   self.size(rng), OrderType.Market, self.now)
         self._next_arrival(self.p.market_rate, rng, self.MARKET)
 
+    def in_stress(self) -> bool:
+        p, t = self.p, self.now / NS
+        return p.stress_len_s > 0 and p.stress_start_s <= t < p.stress_start_s + p.stress_len_s
+
+    def _informed_rate_max(self) -> float:
+        p = self.p
+        return p.informed_rate * (p.stress_informed if p.stress_len_s > 0 else 1.0)
+
     def _informed(self) -> None:
         rng, p = self.rng_informed, self.p
+        # A stress episode raises the arrival rate: arrivals come at the stressed rate and,
+        # outside the episode, are kept with probability 1 / stress_informed (thinning).
+        if p.stress_len_s > 0 and p.stress_informed != 1.0 and not self.in_stress():
+            if rng.random() >= 1 / p.stress_informed:
+                self._next_arrival(self._informed_rate_max(), rng, self.INFORMED_ARRIVAL)
+                return
         v = self.fair_value()
         edge = p.edge_ticks * p.tick
         bid, ask = self.book.best_bid(), self.book.best_ask()
@@ -255,7 +284,7 @@ class _Simulator:
             limit = int(math.ceil((v + edge) / p.tick)) * p.tick
             self.call(INFORMED, self.book.submit, self.new_id(INFORMED), Side.Sell, limit, qty,
                       OrderType.IOC, self.now)
-        self._next_arrival(p.informed_rate, rng, self.INFORMED_ARRIVAL)
+        self._next_arrival(self._informed_rate_max(), rng, self.INFORMED_ARRIVAL)
 
     def _fv_tick(self) -> int:
         return int(round(self.fair_value() / self.p.tick)) * self.p.tick
@@ -267,7 +296,7 @@ class _Simulator:
         end = p.duration_ns
         self._next_arrival(p.limit_rate, self.rng_limit, self.LIMIT)
         self._next_arrival(p.market_rate, self.rng_market, self.MARKET)
-        self._next_arrival(p.informed_rate, self.rng_informed, self.INFORMED_ARRIVAL)
+        self._next_arrival(self._informed_rate_max(), self.rng_informed, self.INFORMED_ARRIVAL)
         if self.participant is not None:
             self.participant.on_start(self)
         while self.heap:

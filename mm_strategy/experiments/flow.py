@@ -78,6 +78,7 @@ def run_session(p: MarketParams, seed: int, strategy) -> dict:
         "inventory": pnl.inventory / DOLLAR, "rebates": -pnl.fees / DOLLAR,
         "volume": pnl.volume, "abs_q": float(np.abs(q).mean()),
         "half_life": inventory_stats(s, mm)["half_life_s"],
+        "drawdown": inventory_stats(s, mm)["max_drawdown"] / DOLLAR,
         "informed": float(f["qty"][f["counterparty"] == INFORMED].sum()
                           / max(f["qty"].sum(), 1)),
         "mk_informed": mk.get(INFORMED, dict.fromkeys(MARKOUT_S, np.nan)),
