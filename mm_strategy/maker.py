@@ -51,6 +51,10 @@ class MarketView:
     mid: float | None  # (bid + ask) / 2 when both exist
     inventory: int  # shares, + long
     tick: int
+    # Everyone else's top price levels, best first, as (price, shares): the maker's own resting
+    # quantity is taken out, and a level left empty is dropped.
+    bids: tuple[tuple[int, int], ...] = ()
+    asks: tuple[tuple[int, int], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -125,10 +129,15 @@ class AvellanedaStoikov:
                 + 2 / self.gamma * math.log1p(self.gamma / self.k))
 
     def quote(self, v: MarketView) -> Quotes:
+        return self.quote_about(v, 0.0)
+
+    def quote_about(self, v: MarketView, shift: float) -> Quotes:
+        """Quotes with the reservation price moved `shift` ticks (a signal's predicted mid
+        change; step 4). shift = 0 is the model as published."""
         if v.mid is None:
             return Quotes(None, None)
         tau = max(v.end - v.now, 0) / NS
-        r = v.mid / v.tick + self.reservation_offset(v.inventory / self.size, tau)
+        r = v.mid / v.tick + shift + self.reservation_offset(v.inventory / self.size, tau)
         half = self.total_spread(tau) / 2
         bid = math.floor(r - half) * v.tick
         ask = math.ceil(r + half) * v.tick
@@ -157,6 +166,7 @@ class MarketMaker:
     strategy: Strategy
     requote_ms: int = 100
     fees: Fees = field(default_factory=Fees)
+    view_levels: int = 5  # price levels per side in the strategy's MarketView
     # Running state, readable after the session.
     inventory: int = 0
     cash: int = 0  # price units, rebates and fees included
@@ -201,21 +211,26 @@ class MarketMaker:
 
     # ---- quoting
 
-    def _market_side(self, book, side: Side) -> int | None:
-        """Best price of everyone else on one side (skipping a level that is only the maker)."""
+    def _market_side(self, book, side: Side) -> tuple[tuple[int, int], ...]:
+        """Everyone else's top levels on one side: the maker's own resting quantity is taken
+        out of its level, and a level that was only the maker is dropped."""
         own = self._live[side]
         mine = book.find(own) if own is not None else None
-        for lv in book.depth(side, 2):
-            if mine is not None and lv.price == mine.price and lv.qty == mine.qty:
-                continue
-            return lv.price
-        return None
+        levels = []
+        for lv in book.depth(side, self.view_levels + 1):
+            qty = lv.qty - (mine.qty if mine is not None and lv.price == mine.price else 0)
+            if qty > 0:
+                levels.append((lv.price, qty))
+        return tuple(levels[: self.view_levels])
 
     def _requote(self, sim) -> None:
         book, p = sim.book, sim.p
-        bid, ask = self._market_side(book, Side.Buy), self._market_side(book, Side.Sell)
+        bids, asks = self._market_side(book, Side.Buy), self._market_side(book, Side.Sell)
+        bid = bids[0][0] if bids else None
+        ask = asks[0][0] if asks else None
         mid = (bid + ask) / 2 if bid is not None and ask is not None else None
-        view = MarketView(sim.now, p.duration_ns, bid, ask, mid, self.inventory, p.tick)
+        view = MarketView(sim.now, p.duration_ns, bid, ask, mid, self.inventory, p.tick,
+                          bids, asks)
         q = self.strategy.quote(view)
         self._place(sim, Side.Buy, q.bid, q.bid_size)
         self._place(sim, Side.Sell, q.ask, q.ask_size)

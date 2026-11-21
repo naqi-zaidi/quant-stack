@@ -54,6 +54,8 @@ jobs:
         run: uv run python -m mm_strategy.experiments.harness --no-figure
       - name: Project 3 step 3 gate (Avellaneda–Stoikov calibrated to the market; its skew controls inventory at 4σ)
         run: uv run python -m mm_strategy.experiments.avellaneda --sessions 6 --no-figure
+      - name: Project 3 step 4 gate (order-flow signal walk-forward; beats no-change out of sample and lifts A–S PnL at 4σ)
+        run: uv run python -m mm_strategy.experiments.flow --sessions 10 --no-figure
 
   cpp:
     name: C++ (${{ matrix.preset }})

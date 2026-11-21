@@ -8,6 +8,7 @@
 **One market-making research system rather than three separate demos.** A Monte Carlo engine simulates a hidden fair value. Agents send orders around it into a C++20 limit order book. A market maker quotes into that book through a risk layer, and analytics score the result.
 
 > **Status:** Foundation done. **Project 1 (Monte Carlo engine) and Project 2 (C++20 limit order book) are complete.** **Project 3, the market maker, is under way.**
+> - **Project 3, step 4 (order-flow signal, walk-forward):** three features of the book predict the mid's next 5 seconds out of sample (R² 3.6% ± 0.15 against no change, above zero on all 40 test days). Moving Avellaneda–Stoikov's reservation price by the prediction turns −$87 ± 30 an hour into **+$249 ± 29**, net of fees, and beats plain A–S in all 40 paired sessions (+$336 ± 18, t = 19). The whole gain is inventory PnL: fills against informed and noise traders both improve by about a third of a tick. Order-flow imbalance on its own predicts reversal here, not continuation.
 > - **Project 3, step 3 (Avellaneda–Stoikov):** calibrated to the market (σ, and the fill-intensity decay k). Its inventory skew cuts mean inventory from about 1,000 shares to 99 (t = −32), and PnL risk to a fifth of the best fixed spread's at the same mean PnL. It beats the 1-tick spread by $874 ± 180 an hour, but it still loses $87 ± 30 an hour to informed flow.
 > - **Project 3, step 2 (market-making harness):** a maker quotes through the C++ book. Its books reconcile exactly with the engine's trade record, and PnL splits exactly into spread capture, inventory PnL and fees. A fixed-spread baseline captures about $2,400 an hour in spread but loses more than that on its inventory; Avellaneda–Stoikov's inventory skew comes next.
 > - **Project 3, step 1 (synthetic market):** Project 1's Monte Carlo engine simulates a hidden fair value, and noise and informed traders send orders into the C++ book. The mid stays a median 2.2 ticks from the fair value. Adverse selection is measurable: passive orders lose 4.2 ± 0.1 ticks per share over 10 seconds when they trade with informed flow (t = −51).
@@ -30,6 +31,81 @@
 > CI runs a gate for every step.
 
 ## Results so far
+
+### Market maker: an order-flow signal, fitted walk-forward (Project 3, step 4)
+
+**The signal** ([`mm_strategy/signals.py`](mm_strategy/signals.py)). At each 100 ms decision the maker computes three features of everyone else's book, with its own orders taken out:
+- order-flow imbalance over the last 5 s ([Cont, Kukanov and Stoikov](https://arxiv.org/abs/1011.6402)), from consecutive snapshots of the best quotes;
+- depth imbalance within 3 ticks of the best, (D_bid − D_ask) / (D_bid + D_ask);
+- the mid's change over the last second.
+
+A linear model with no intercept predicts the mid's change over the next 5 seconds. **A–S + flow** moves Avellaneda–Stoikov's reservation price by that prediction, r = s + ŷ − q γ σ² τ, and is otherwise step 3's model at γ = 3e−4. The market has no drift, so an intercept would only fit noise as a constant lean.
+
+**Protocol, in time order:**
+1. σ and k come from step 3's calibration (seeds 1001–1010, no maker).
+2. History block: plain A–S trades seeds 1001–1010 and records its features. The horizon (5 s) and the weight on the prediction (1, which makes r the expected mid) were fixed on this block, before any test session ran. 5 s is where the block's forecast R² peaks, tied with 2 s.
+3. Test, walk-forward, on seeds 1–40 in order. Day d trades with a model fitted on the history block and days 1 to d − 1 only, then its own log joins the training set. The gate rebuilds every day's model from the logs before that day and checks that it matches exactly.
+
+Fixed spreads and plain A–S trade the same 40 seeds, so every comparison is paired. Run with `uv run python -m mm_strategy.experiments.flow --sessions 40 --sensitivity` (about 10 minutes); CI runs 10 sessions without the sensitivity sweep.
+
+**Forecast skill**, as R² against the no-change forecast (1 − Σ(y − ŷ)² / Σy²), the quote a maker without a signal implicitly makes:
+
+| Sample | R²_oos, 5 s |
+|---|---:|
+| History block: each session predicted by a model fitted on the other nine | 3.82% ± 0.40 |
+| **Test days, walk-forward** | **3.61% ± 0.15** (t = 24; above zero on all 40 days) |
+
+| Features (history block, leave one session out) | R²_oos, 5 s |
+|---|---:|
+| order-flow imbalance | 1.26% ± 0.20 |
+| depth imbalance | 1.41% ± 0.19 |
+| mid change, last 1 s | 1.54% ± 0.09 |
+| order-flow imbalance + depth imbalance | 3.19% ± 0.41 |
+| all three | 3.82% ± 0.40 |
+
+Per standard deviation of each feature, the model predicts +0.51 to +0.54 ticks over 5 s for depth imbalance, −0.35 to −0.37 for the last second's move, and −0.39 to −0.49 for order-flow imbalance. These are the ranges over all 40 daily refits. The signal moves the reservation price by 0.77 ticks (s.d.).
+
+**Results**, 40 one-hour sessions:
+
+| Strategy | Net PnL ($/hour) | Spread capture | Inventory PnL | Rebates | Volume | Mean \|inventory\| | PnL s.d. | 10 s markout vs informed (ticks) |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| fixed 1 tick | −961 ± 184 | +2,420 | −3,759 | +377 | 188,742 | 999 | 1,161 | −3.46 ± 0.05 |
+| fixed 3 ticks | −160 ± 149 | +2,235 | −2,532 | +137 | 68,522 | 969 | 940 | −4.07 ± 0.08 |
+| A–S, γ = 3e−4 | −87 ± 30 | +2,184 | −2,436 | +165 | 82,482 | 99 | 187 | −4.32 ± 0.08 |
+| **A–S + flow** | **+249 ± 29** | +2,176 | −2,086 | +159 | 79,338 | 107 | 184 | **−3.96 ± 0.08** |
+
+The first three rows reproduce step 3's 40-session table exactly. Net PnL includes the illustrative maker rebate.
+
+| Paired comparison | Difference | t |
+|---|---:|---:|
+| net PnL, A–S + flow − A–S | **+$336 ± 18** | +19.2 (gated at 4σ) |
+| inventory PnL, A–S + flow − A–S | +$351 ± 21 | +16.5 |
+| spread capture, A–S + flow − A–S | −$8 ± 12 | −0.7 |
+| mean \|inventory\|, A–S + flow − A–S | +8 ± 2 shares | +3.7 |
+| net PnL, A–S + flow − fixed 1 tick | +$1,210 ± 179 | +6.7 |
+| net PnL, A–S + flow − fixed 3 ticks | +$410 ± 146 | +2.8 |
+
+**Not tuned to a knife edge.** On the history block, cross-fitted (each session traded with a model fitted on the other nine), every horizon and weight tried improves on plain A–S. The setting used, 5 s at weight 1, isn't the best of them; 2 s at weight 2 is.
+
+| A–S + flow − A–S, history block ($/hour) | weight 0.5 | weight 1 | weight 2 |
+|---|---:|---:|---:|
+| 2 s | +142 ± 45 | +284 ± 40 | +448 ± 49 |
+| 5 s | +250 ± 48 | **+401 ± 60** | +431 ± 68 |
+| 10 s | +259 ± 49 | +439 ± 71 | +411 ± 71 |
+| 20 s | +263 ± 45 | +439 ± 55 | +404 ± 90 |
+
+![Order-flow signal](docs/figures/p3_flow.png)
+
+**What the signal does.** The gain is all inventory PnL (+$351 ± 21); spread capture doesn't change (−$8 ± 12). The signal doesn't earn by quoting wider or tighter. It earns by leaning the quotes toward the side of the next move.
+- Both kinds of fill improve, by about a third of a tick a share at 10 s:
+  - against informed traders, −4.32 → −3.96;
+  - against noise traders, +2.29 → +2.63.
+- The average fill flips from losing 0.34 ticks at 10 s to earning 0.12.
+- Informed traders get 8% fewer shares from the maker (30,235 vs 32,750 an hour).
+
+**Order-flow imbalance predicts reversal.** Its coefficient is negative: after net buying pressure, the mid tends to give some of it back over the next 5 s. In step 6, order-flow imbalance explained 41% of *same-interval* moves on AAPL. Predicting the *next* interval is a different question. In this market, most aggressive flow is noise, which pushes the mid away from the fair value until informed traders pull it back (step 1), and the negative sign is consistent with that construction. Depth imbalance carries the continuation signal, and the two work together: 1.26% and 1.41% of R² alone, 3.19% combined.
+
+**What it doesn't settle.** A–S + flow is the first strategy in this project to make money, net of fees ($249 ± 29 an hour, t = 8.6). Against the 3-tick spread, the margin is positive at t = 2.8, short of the 4σ bar this README uses for claims. Every session here comes from one synthetic market whose informed traders never adapt to the maker. Historical replay on the AAPL day comes next (step 5).
 
 ### Market maker: Avellaneda–Stoikov, calibrated to the market (Project 3, step 3)
 
@@ -82,7 +158,7 @@ Mean PnL is a different story:
 - Against the no-skew control, it is suggestive but not significant (t = 2.0).
 - Even the best setting loses about $87 an hour.
 
-The inventory PnL stays negative even near flat (−$2,436 at γ = 3e−4), because informed flow moves the price through the quotes before any skew can respond. That loss is adverse selection, not inventory risk. Order-flow imbalance, which sees informed pressure building (step 4), is aimed at it. Larger γ trades volume for safety: at 3e−3 the maker trades less than half as much, and its spread capture falls further than its inventory losses.
+The inventory PnL stays negative even near flat (−$2,436 at γ = 3e−4), because informed flow moves the price through the quotes before any skew can respond. That loss is adverse selection, not inventory risk. Step 4's order-flow signal is aimed at it. Larger γ trades volume for safety: at 3e−3 the maker trades less than half as much, and its spread capture falls further than its inventory losses.
 
 ### Market maker: the harness and a fixed-spread baseline (Project 3, step 2)
 
@@ -772,7 +848,7 @@ flowchart TB
     REPLAY["Historical replay<br/>LOBSTER Nasdaq messages / crypto L2"]
     AGENTS["Order-flow agents<br/>noise + informed traders"]
     LOB["Project 2 · Limit order book (C++20)<br/>price-time priority, O(1) cancels"]
-    MM["Project 3 · Market maker<br/>Avellaneda–Stoikov + OFI skew"]
+    MM["Project 3 · Market maker<br/>Avellaneda–Stoikov + order-flow signal"]
     RISK["Risk overlay (from my FYP)<br/>inventory caps, throttle, kill switch"]
     AN["Analytics<br/>PnL split, markouts, Sharpe"]
 
@@ -792,7 +868,7 @@ flowchart TB
 | 0 · Foundation | Monorepo, CMake + uv, CI with ASan/UBSan, LOBSTER loader | CI green | ✅ done |
 | 1 · Monte Carlo engine | Pricer with error bars ✅ → variance reduction ✅ → Greeks ✅ → Asian/barrier/American (Longstaff–Schwartz) ✅ → Merton + Heston ✅ → SPY calibration ✅ → Numba ✅ | MC within its standard error of Black–Scholes | ✅ done |
 | 2 · Limit order book | Matching engine ✅ → property tests ✅ → LOBSTER replay ✅ → snapshot tests + pinned digests ✅ → benchmarks ✅ → pybind11 module ✅ → microstructure analytics ✅ | Rebuilt book matches LOBSTER on every event ✅ (AAPL: 400,390 events, 0 mismatches) | ✅ done |
-| 3 · Market maker | Synthetic market ✅ → harness, PnL split, markouts ✅ → Avellaneda–Stoikov ✅ → OFI skew (walk-forward) → historical replay → FYP risk overlay → head-to-head | Walk-forward, out-of-sample, net of fees | 🔨 in progress |
+| 3 · Market maker | Synthetic market ✅ → harness, PnL split, markouts ✅ → Avellaneda–Stoikov ✅ → order-flow signal (walk-forward) ✅ → historical replay → FYP risk overlay → head-to-head | Walk-forward, out-of-sample, net of fees | 🔨 in progress |
 | 4 · Add-ons | Delta-hedging PnL simulator, Almgren–Chriss execution on the book | — | ⏳ |
 
 ## Quickstart
@@ -934,9 +1010,10 @@ quant-stack/
   mm_strategy/        Project 3: synthetic market (hidden GBM fair value, noise and informed
                       traders, event loop into the C++ book), markouts, the market maker
                       (maker.py: quoting, fills, fixed spread, Avellaneda–Stoikov), its
-                      accounting, and calibration of σ and fill intensity
+                      accounting, calibration of σ and fill intensity, and order-flow
+                      signals with the walk-forward (signals.py)
     experiments/      one gate per step (market.py: step 1, harness.py: step 2,
-                      avellaneda.py: step 3)
+                      avellaneda.py: step 3, flow.py: step 4)
   marketdata/         loaders: LOBSTER, option-chain snapshots → implied-vol surface
   tests/              pytest + Hypothesis property tests
   data/               market data: committed snapshots in data/snapshots/, the rest git-ignored
@@ -968,6 +1045,8 @@ quant-stack/
 - Order book tests: the reference model and the engine share an author, so a misreading of the matching rules common to both would pass the comparison. The planted bugs show the checks can catch errors; they don't prove the rules match an exchange's. Step 3's replay against real Nasdaq data is that outside check.
 - Avellaneda–Stoikov is calibrated once, on separate sessions, and held fixed. σ is estimated at 60-second sampling, which still sits 2.4 s.e. above the true value. The finite-horizon formulas make the skew strongest at the open, so this session-long horizon is a modelling choice.
 - Market maker: PnL is marked to the closing mid, without the cost of flattening the position. Decisions come on a fixed 100 ms clock, with no reaction to individual book events, and the quote size ignores queue position. Fees are illustrative, not one exchange's schedule.
+- Order-flow signal: linear in three features, scored on decisions every 100 ms with overlapping 5-second targets. Standard errors come from session-to-session variation, which is valid because sessions are independent; row-level statistics would overstate precision. The horizon and weight were fixed by inspecting the history block (the sensitivity table shows the neighbourhood), not by an automatic rule. The training set mixes plain A–S logs (history) with A–S + flow logs (test days).
+- Walk-forward across independent synthetic sessions rules out look-ahead, but the market never changes regime, so it can't test whether the model goes stale. The AAPL replay (step 5) splits one real day instead.
 - Synthetic market: the noise traders know nothing and the informed traders know everything. There are no momentum traders, no news jumps, and no other market makers yet. The fair value is GBM with constant volatility. The parameters were chosen for a sensible book, not fitted to a real stock.
 - Analytics: the windows count quote updates, not time. Time windows (the last 10 s, say) aren't built yet. The real-data check covers one stock-day and one tick size. The OFI regression pools the whole day. The queue tracker counts the replay's anonymous blocks (orders that rested before the open or outside the visible levels) as single orders.
 - Python module: crossing into C++ costs about 0.3 µs a call, so a strategy that sends millions of orders spends most of its engine time on the boundary. A batch call taking arrays would amortise it; it isn't built. Each book or replay belongs to one thread.
