@@ -48,6 +48,14 @@ def bs_delta(s, k, t, r, sigma, q=0.0, kind: OptionKind = "call") -> np.ndarray:
     return carry * ndtr(d1) if kind == "call" else carry * (ndtr(d1) - 1.0)
 
 
+def bs_gamma(s, k, t, r, sigma, q=0.0) -> np.ndarray:
+    """d²Price/dS². Same for calls and puts."""
+    d1, _ = _d1_d2(s, k, t, r, sigma, q)
+    pdf = np.exp(-0.5 * d1**2) / np.sqrt(2.0 * np.pi)
+    carry = np.exp(-np.asarray(q) * np.asarray(t))
+    return carry * pdf / (np.asarray(s) * np.asarray(sigma) * np.sqrt(t))
+
+
 def bs_vega(s, k, t, r, sigma, q=0.0) -> np.ndarray:
     """dPrice/dsigma per 1.00 of vol (not per vol point). Same for calls and puts."""
     d1, _ = _d1_d2(s, k, t, r, sigma, q)

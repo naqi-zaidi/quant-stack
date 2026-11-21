@@ -7,7 +7,8 @@
 
 **One market-making research system rather than three separate demos.** A Monte Carlo engine simulates a hidden fair value. Agents send orders around it into a C++20 limit order book. A market maker quotes into that book through a risk layer, and analytics score the result.
 
-> **Status:** Foundation done. **Projects 1, 2 and 3 are complete:** a Monte Carlo engine, a C++20 limit order book, and a market maker evaluated walk-forward on synthetic and real data. The Phase 4 add-ons come next.
+> **Status:** Foundation done. **Projects 1, 2 and 3 are complete:** a Monte Carlo engine, a C++20 limit order book, and a market maker evaluated walk-forward on synthetic and real data. **Phase 4 is under way:** step 1, delta hedging, is done; Almgren–Chriss execution on the book is next.
+> - **Phase 4, step 1 (delta hedging):** a short call sold at 20% implied vol, hedged 4 to 1,024 times over 3 months, with realized vol of 15%, 20% or 25%. Mean P&L equals BS(σi) − BS(σr) in all 45 cells, as it must exactly. Hedged at realized vol, the risk falls like 1/√n, within 3% of Derman & Kamal's formula. Hedged at implied vol, it levels off at 0.32–0.41 per call, because P&L converges path by path to ½ΓS²(σi² − σr²) summed over the path (corr 0.98 at σr = 15%). Turnover grows like √n, so costs set the hedging frequency: the best n halves each time the cost doubles (512, 256, 128 at 2, 5, 10 bp).
 > - **Project 3, step 7 (head-to-head, the Phase 3 gate):** six strategies in four environments, from one command, walk-forward and net of fees. A–S + flow is the only strategy profitable at 4σ: $249 ± 29 an hour live on the synthetic market, $276 ± 23 with the risk overlay, and profitable when replayed as well. It doesn't survive a hidden stress episode (−$20 ± 31) or Nasdaq's AAPL day, where every strategy loses money. Inventory skew cuts PnL risk at least five-fold in both the synthetic market and on AAPL.
 > - **Project 3, step 6 (risk overlay from my FYP):** the FYP's regime detector, anomaly scorer and Allow/Throttle/Pause state machine, ported with its frozen parameters and checked against the FYP's own code on 9,000 decisions, plus an inventory cap and a drawdown kill switch. The synthetic market gains hidden 5-minute stress episodes. The FYP policy flags every episode (median 11 s), but it covers only 17% of each episode's bars and throttles 11.6% of calm bars, failing its own 5% restraint test. The overlay matters most where inventory is otherwise uncontrolled. For a fixed spread under stress, it caps the position at about 600 shares (from 2,000), halves the worst drawdown and recovers $755 ± 182 an hour. For A–S + flow, which already controls its inventory, it adds +$38 ± 18. On AAPL it trims the losses by $67–83 an hour, but they remain.
 > - **Project 3, step 5 (historical replay):** makers trade a replayed tape with virtual orders that wait their turn in the queue. The replay was measured first on the synthetic market, where the same strategy can also trade live. It shows a strategy exactly the live market (every decision of all 40 sessions), keeps the four strategies in the same order, and is at most $135 ± 26 an hour too optimistic. On Nasdaq's AAPL day, walk-forward over 11 half-hour blocks, nothing makes money. A–S loses $1,099 ± 159 an hour and loses in every block. The flow signal's forecast falls to R² 0.4% (from 3.6%) and doesn't change the PnL (−$25 ± 38). On AAPL, past order flow predicts continuation.
@@ -34,6 +35,45 @@
 > CI runs a gate for every step.
 
 ## Results so far
+
+### Delta hedging: what discrete hedging leaves behind (Phase 4, step 1)
+
+**One command** ([`experiments/hedging.py`](mc_engine/experiments/hedging.py)): `uv run python -m mc_engine.experiments.hedging` (about 15 s; CI runs it in full).
+
+**Setup.** A dealer sells a 3-month at-the-money call (S0 = K = 100, r = 3%) at 20% implied vol and takes the Black–Scholes premium, 4.358. It holds the Black–Scholes delta, rebalanced n times, with n from 4 to 1,024 (1,024 is roughly every 25 trading minutes). The stock's realized vol is 15%, 20% or 25%, and the hedge uses either the implied vol or the realized vol. All cells run on 20,000 exact GBM paths drifting at r. Every n and hedge reuses the same paths, and the three vols reuse the same normals. [`hedging.py`](mc_engine/hedging.py) returns, per path:
+- the P&L in time-0 money;
+- its second-order part, Σ ½Γ_h S²(σh² dt − R²), where R is each period's return;
+- dollar gamma, Σ ½Γ_h S² dt;
+- turnover, so any cost level is one multiplication.
+
+The call is physically settled, so the only closing trade is the gap between the last delta and the share delivered.
+
+| Realized vol, hedge at | Mean P&L, n = 1,024 (target) | s.d., n = 16 | n = 64 | n = 256 | n = 1,024 | s.d. as n → ∞ |
+|---|---:|---:|---:|---:|---:|---:|
+| 15%, implied vol | +0.986 ± 0.002 (+0.989) | 0.701 | 0.449 | 0.354 | 0.327 | 0.316 |
+| 15%, realized vol | +0.989 ± 0.001 (+0.989) | 0.625 | 0.319 | 0.160 | **0.082** | 0 |
+| 20% (the two coincide) | +0.000 ± 0.001 (0) | 0.834 | 0.426 | 0.214 | **0.110** | 0 |
+| 25%, implied vol | −0.985 ± 0.003 (−0.990) | 1.116 | 0.674 | 0.495 | 0.437 | 0.413 |
+| 25%, realized vol | −0.989 ± 0.001 (−0.990) | 1.042 | 0.532 | 0.267 | **0.137** | 0 |
+
+P&L per call. The target is BS(20%) − BS(σr). The last column is the s.d. of the continuous-time limit, computed path by path.
+
+- **The mean is fixed when the option is sold.** In all 45 cells (5 policies × 9 frequencies), mean P&L equals BS(20%) − BS(σr) within 4 s.e. (largest |z| = 1.6). This holds exactly, not approximately. With the stock drifting at r, the discounted hedge gains have mean zero whatever the hedge ratio or frequency. Selling 20% vol when 15% is realized earns +0.989 per call on average however it is hedged. The choice of hedge changes only the spread around that mean.
+- **Hedged at realized vol, the risk goes to zero like 1/√n.** The s.d. halves each time n quadruples. For n ≥ 64 it is within 3% of Derman & Kamal's (1999) √(π/4n)·vega·σr: 0.0820 against 0.0821 at n = 1,024, σr = 15%.
+- **Hedged at implied vol, it doesn't.** The s.d. levels off near 0.32 (σr = 15%) and 0.41 (σr = 25%). As n grows, P&L converges path by path to (σi² − σr²)·Σ ½ΓS² dt: the variance spread, earned in proportion to the gamma the path collects. At n = 1,024 the correlation is 0.978 and 0.933. Paths that stay near the strike, where gamma is high, earn much more than paths that run away from it, and no amount of rebalancing changes that. In exchange, the profit accrues smoothly: in the continuous limit, with σi > σr, every step adds a non-negative amount. The realized-vol hedge locks in the total but swings along the way, and it needs σr, which nobody knows in advance (the trade-off is in Ahmad & Wilmott, 2005).
+- **The gamma term is the P&L.** The second-order decomposition explains 82–88% of P&L variance at n = 4 and 99.1–99.9% at n = 1,024. What's left is third-order and timing terms.
+- **Costs set the frequency.** Rebalancing turnover grows like √n (fitted slope 0.49–0.50), the scaling behind Leland's (1985) cost-adjusted volatility, while the s.d. falls like 1/√n. So the RMSE of net P&L around its frictionless target has an interior minimum: n* = 512 at 2 bp a trade, 256 at 5 bp and 128 at 10 bp. Doubling the cost halves the best frequency, as the two √n laws imply (n* ∝ 1/cost). At 10 bp, hedging at n = 1,024 costs 1.06 per call, about a quarter of the premium, and leaves twice the best RMSE (1.135 against 0.534).
+
+![Delta hedging](docs/figures/p4_hedging.png)
+
+**Gate (CI).** All five checks are exact or asymptotic, with nothing tuned:
+1. The mean-P&L identity holds within 4 s.e. in every cell.
+2. P&L minus its continuous-time limit has s.d. slope within 0.05 of −½ for every policy (fitted over n ≥ 64).
+3. Realized-vol hedges are within 5% of Derman–Kamal for n ≥ 64.
+4. The gamma decomposition's R² rises with n and reaches at least 98% at n = 1,024.
+5. Turnover slope is within 0.05 of ½.
+
+The Derman–Kamal constant is checked against QuantLib's DiscreteHedging example, which uses the same formula. The tests check the vectorised bookkeeping against a scalar step-by-step reference to 1e-12, with costs. They also check that a hedged call and a hedged put give identical P&L on every path, as put–call parity requires.
 
 ### Market maker: head-to-head, and the Phase 3 gate (Project 3, step 7)
 
@@ -1061,7 +1101,7 @@ flowchart TB
 | 1 · Monte Carlo engine | Pricer with error bars ✅ → variance reduction ✅ → Greeks ✅ → Asian/barrier/American (Longstaff–Schwartz) ✅ → Merton + Heston ✅ → SPY calibration ✅ → Numba ✅ | MC within its standard error of Black–Scholes | ✅ done |
 | 2 · Limit order book | Matching engine ✅ → property tests ✅ → LOBSTER replay ✅ → snapshot tests + pinned digests ✅ → benchmarks ✅ → pybind11 module ✅ → microstructure analytics ✅ | Rebuilt book matches LOBSTER on every event ✅ (AAPL: 400,390 events, 0 mismatches) | ✅ done |
 | 3 · Market maker | Synthetic market ✅ → harness, PnL split, markouts ✅ → Avellaneda–Stoikov ✅ → order-flow signal (walk-forward) ✅ → historical replay, with the replay's blind spot measured ✅ → FYP risk overlay ✅ → head-to-head ✅ | Walk-forward, out-of-sample, net of fees ✅ (met on the calm synthetic market; not under stress or on AAPL) | ✅ done |
-| 4 · Add-ons | Delta-hedging PnL simulator, Almgren–Chriss execution on the book | — | ⏳ |
+| 4 · Add-ons | Delta-hedging P&L simulator ✅ → Almgren–Chriss execution on the book | Mean P&L = BS(σi) − BS(σr) exactly; hedging error 1/√n (Derman–Kamal) ✅ | ⏳ step 1 of 2 |
 
 ## Quickstart
 
@@ -1085,6 +1125,7 @@ uv run python -m orderbook.microstructure                  # Phase 2 step 6: ana
 uv run python -m mm_strategy.experiments.market            # Project 3 step 1: synthetic market gate (~12 s)
 uv run python -m mm_strategy.experiments.harness           # Project 3 step 2: maker harness gate (~45 s)
 uv run python -m mm_strategy.experiments.avellaneda        # Project 3 step 3: A–S γ sweep (~1.5 min; README used --sessions 40)
+uv run python -m mc_engine.experiments.hedging             # Phase 4 step 1: delta hedging gate + figure (~15 s)
 ```
 
 C++ core (needs CMake ≥ 3.25 and a C++20 compiler):
@@ -1175,6 +1216,13 @@ calibrate(surface).params
 from mc_engine.fast import price_heston_numba
 
 price_heston_numba(100, 100, 1.0, 0.05, p, n_steps=252, n_paths=1 << 18, parallel=True)
+
+# Sell a call at 20% vol, delta-hedge it 64 times while 15% is realized
+from mc_engine.hedging import delta_hedge, gbm_grid
+
+paths = gbm_grid(100, 0.03, 0.15, 0.25, n_steps=1024, n_paths=20_000, seed=0)
+h = delta_hedge(paths, 100, 0.25, 0.03, sigma_implied=0.20, sigma_hedge=0.15, n_rebalances=64)
+h.mean_se(), h.pnl.std(), h.net(5e-4).mean()  # ≈ BS(20%) − BS(15%), the spread, after 5 bp
 ```
 
 ## Layout
@@ -1185,7 +1233,9 @@ quant-stack/
                       variance reduction, Brownian bridge + scrambled Sobol, Greeks,
                       Asian / barrier / American (Longstaff–Schwartz + binomial reference),
                       Merton jump-diffusion, Heston (semi-analytic, Euler, QE), implied vol,
-                      fast Heston surface pricer + calibration, Numba kernels (fast.py)
+                      fast Heston surface pricer + calibration, Numba kernels (fast.py),
+                      discrete delta hedging with its gamma decomposition (hedging.py,
+                      Phase 4 step 1)
     experiments/      scripts that produce every number in this README
   lob/                Project 2: C++20 matching engine (order_book) over map or array price
                       levels (levels), id map, object pool, event stream, LOBSTER replay,
@@ -1229,6 +1279,7 @@ quant-stack/
 
 ## Current limitations
 
+- Delta hedging: GBM with constant volatility, so implied vol never moves and there are no jumps. The stock drifts at r; with a real-world drift, the mean-P&L identity holds only as n → ∞. Rebalancing is on an even clock, not on moves (no Whalley–Wilmott bands). Costs are proportional, with no spread that widens in fast markets. The best n minimises one criterion, the RMSE around the frictionless target, for one contract.
 - Barriers: only the down-and-out call with barrier ≤ strike has a closed form here. The bridge correction works for any single barrier, but the other cases have no reference yet.
 - Longstaff–Schwartz gives a lower bound only, with a fixed cubic basis. An Andersen–Broadie duality upper bound would bracket the true price from both sides.
 - Timings come from one machine: a 2-vCPU cloud container here. The variance-reduction factors and correctness results are machine-independent, and the throughput figures aren't. Parallel scaling was only measured up to 2 threads; rerun `mc_engine.experiments.speed` on more cores.
