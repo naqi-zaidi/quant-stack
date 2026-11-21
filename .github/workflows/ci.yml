@@ -52,6 +52,8 @@ jobs:
         run: uv run python -m mm_strategy.experiments.market --no-figure
       - name: Project 3 step 2 gate (maker's books reconcile with the engine; PnL identity exact; never takes liquidity)
         run: uv run python -m mm_strategy.experiments.harness --no-figure
+      - name: Project 3 step 3 gate (Avellaneda–Stoikov calibrated to the market; its skew controls inventory at 4σ)
+        run: uv run python -m mm_strategy.experiments.avellaneda --sessions 6 --no-figure
 
   cpp:
     name: C++ (${{ matrix.preset }})

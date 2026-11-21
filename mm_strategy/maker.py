@@ -90,6 +90,56 @@ class FixedSpread:
         )
 
 
+@dataclass(frozen=True)
+class AvellanedaStoikov:
+    """Avellaneda and Stoikov (2008), "High-frequency trading in a limit order book".
+
+    With mid s, inventory q (in lots of `size` shares), risk aversion gamma and time to the
+    close tau:
+
+        reservation price  r = s - q * gamma * sigma^2 * tau
+        total spread       delta_a + delta_b = gamma * sigma^2 * tau + (2/gamma) ln(1 + gamma/k)
+
+    It quotes symmetrically about r: bid r - spread/2, ask r + spread/2, rounded away from r to
+    the tick. Units are ticks and seconds: sigma in ticks per sqrt(s), k per tick (from fill
+    intensity A exp(-k delta)), gamma per tick per lot. A long position pulls both quotes down,
+    so the maker sells more and buys less. gamma = 0 is the no-skew limit: total spread 2/k
+    about the mid. The inventory limit still applies as a hard backstop.
+    """
+
+    gamma: float
+    sigma: float
+    k: float
+    size: int = 100
+    max_inventory: int = 2_000
+
+    def reservation_offset(self, q_lots: float, tau_s: float) -> float:
+        """r - s, in ticks."""
+        return -q_lots * self.gamma * self.sigma**2 * tau_s
+
+    def total_spread(self, tau_s: float) -> float:
+        """delta_a + delta_b, in ticks."""
+        if self.gamma == 0:
+            return 2 / self.k
+        return (self.gamma * self.sigma**2 * tau_s
+                + 2 / self.gamma * math.log1p(self.gamma / self.k))
+
+    def quote(self, v: MarketView) -> Quotes:
+        if v.mid is None:
+            return Quotes(None, None)
+        tau = max(v.end - v.now, 0) / NS
+        r = v.mid / v.tick + self.reservation_offset(v.inventory / self.size, tau)
+        half = self.total_spread(tau) / 2
+        bid = math.floor(r - half) * v.tick
+        ask = math.ceil(r + half) * v.tick
+        return Quotes(
+            bid if v.inventory + self.size <= self.max_inventory else None,
+            ask if v.inventory - self.size >= -self.max_inventory else None,
+            self.size,
+            self.size,
+        )
+
+
 @dataclass
 class Fill:
     ts: int

@@ -8,6 +8,7 @@
 **One market-making research system rather than three separate demos.** A Monte Carlo engine simulates a hidden fair value. Agents send orders around it into a C++20 limit order book. A market maker quotes into that book through a risk layer, and analytics score the result.
 
 > **Status:** Foundation done. **Project 1 (Monte Carlo engine) and Project 2 (C++20 limit order book) are complete.** **Project 3, the market maker, is under way.**
+> - **Project 3, step 3 (Avellaneda–Stoikov):** calibrated to the market (σ, and the fill-intensity decay k). Its inventory skew cuts mean inventory from about 1,000 shares to 99 (t = −32), and PnL risk to a fifth of the best fixed spread's at the same mean PnL. It beats the 1-tick spread by $874 ± 180 an hour, but it still loses $87 ± 30 an hour to informed flow.
 > - **Project 3, step 2 (market-making harness):** a maker quotes through the C++ book. Its books reconcile exactly with the engine's trade record, and PnL splits exactly into spread capture, inventory PnL and fees. A fixed-spread baseline captures about $2,400 an hour in spread but loses more than that on its inventory; Avellaneda–Stoikov's inventory skew comes next.
 > - **Project 3, step 1 (synthetic market):** Project 1's Monte Carlo engine simulates a hidden fair value, and noise and informed traders send orders into the C++ book. The mid stays a median 2.2 ticks from the fair value. Adverse selection is measurable: passive orders lose 4.2 ± 0.1 ticks per share over 10 seconds when they trade with informed flow (t = −51).
 > - **Project 2, step 6 (microstructure analytics):** spread distribution, depth profile, order-flow imbalance and queue positions, each a C++ listener that rebuilds its own view of the book from the event stream alone. On the AAPL day, all of them match the same statistics computed directly from LOBSTER's own book file, exactly. Order-flow imbalance explains 41% of 10-second price moves (95% CI 33–51%).
@@ -29,6 +30,59 @@
 > CI runs a gate for every step.
 
 ## Results so far
+
+### Market maker: Avellaneda–Stoikov, calibrated to the market (Project 3, step 3)
+
+**The model** ([Avellaneda and Stoikov 2008](https://doi.org/10.1080/14697680701381228)). With mid s, inventory q in lots of 100 shares, and τ seconds to the close, the maker quotes symmetrically about a reservation price r, with total spread δ:
+
+r = s − q γ σ² τ,  δ = γ σ² τ + (2/γ) ln(1 + γ/k)
+
+A long position lowers both quotes, so the maker sells more and buys less. γ is risk aversion. γ = 0 keeps the model's quote width, 2/k, but drops the skew; it serves here as a control.
+
+**Calibration** ([`mm_strategy/calibration.py`](mm_strategy/calibration.py)) runs on sessions of its own (seeds 1001–1010, no maker):
+
+| Input | Estimate ± s.e. | Check |
+|---|---|---|
+| σ from 60 s mid changes (ticks/√s) | 1.360 ± 0.053 | fair value's true σ is 1.235: +2.4 s.e. |
+| σ from 1 s mid changes | 2.692 ± 0.026 | 2.2× the truth: bid-ask bounce, not volatility |
+| k, decay of fill intensity λ(δ) = A e^(−kδ) | 0.478 ± 0.005 per tick | log-linear R² 0.975 |
+| A | 0.567 ± 0.004 per s per side | – |
+
+λ(δ) is the rate at which aggressive orders reach δ ticks from the mid that stood before them. The signature plot (top left) shows why σ comes from 60-second changes and not 1-second ones.
+
+**Evaluation**: 40 one-hour sessions on seeds 1–40, all paired. The same seed gives every strategy the same fair value and the same noise and informed arrival times. Run with `uv run python -m mm_strategy.experiments.avellaneda --sessions 40`; CI runs 6.
+
+| Strategy | Net PnL ($/hour) | Spread capture | Inventory PnL | Volume | Mean \|inventory\| | Half-life | PnL s.d. |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| fixed 1 tick | −961 ± 184 | +2,420 | −3,759 | 188,742 | 999 | 296 s | 1,161 |
+| fixed 3 ticks | −160 ± 149 | +2,235 | −2,532 | 68,522 | 969 | 589 s | 940 |
+| A–S γ = 0 (no skew) | −430 ± 172 | +2,387 | −2,997 | 90,480 | 988 | 473 s | 1,089 |
+| A–S γ = 3e−5 | −248 ± 87 | +2,420 | −2,857 | 94,140 | 343 | 121 s | 548 |
+| A–S γ = 1e−4 | −187 ± 51 | +2,341 | −2,711 | 91,338 | 187 | 46 s | 325 |
+| **A–S γ = 3e−4** | **−87 ± 30** | +2,184 | −2,436 | 82,482 | **99** | **17 s** | **187** |
+| A–S γ = 1e−3 | −186 ± 21 | +1,772 | −2,081 | 61,982 | 41 | 7 s | 134 |
+| A–S γ = 3e−3 | −202 ± 20 | +1,127 | −1,394 | 32,422 | 16 | 5 s | 124 |
+
+Paired differences (± paired s.e.):
+
+| Comparison | Difference | t |
+|---|---:|---:|
+| mean \|inventory\|, γ = 3e−4 − no skew | −889 ± 28 shares | −32.2 (the gate checks every γ > 0 at 4σ) |
+| net PnL, γ = 3e−4 − fixed 1 tick | +$874 ± 180 | +4.8 |
+| net PnL, γ = 3e−4 − no skew | +$342 ± 169 | +2.0 |
+| net PnL, γ = 3e−4 − fixed 3 ticks | +$73 ± 147 | +0.5 |
+
+![Avellaneda–Stoikov](docs/figures/p3_avellaneda.png)
+
+**What the skew buys and what it doesn't.** It controls inventory decisively: mean |inventory| falls from about 1,000 shares to 16–343 depending on γ, and the half-life from 5–10 minutes to 5–121 seconds. Since inventory is the noisy part of the PnL, the PnL standard deviation falls with it, from $940 an hour for the best fixed spread to $187 at γ = 3e−4.
+
+Mean PnL is a different story:
+- Against the 1-tick spread, the skew wins clearly.
+- Against the 3-tick spread, the difference is indistinguishable from zero (+$73 ± 147).
+- Against the no-skew control, it is suggestive but not significant (t = 2.0).
+- Even the best setting loses about $87 an hour.
+
+The inventory PnL stays negative even near flat (−$2,436 at γ = 3e−4), because informed flow moves the price through the quotes before any skew can respond. That loss is adverse selection, not inventory risk. Order-flow imbalance, which sees informed pressure building (step 4), is aimed at it. Larger γ trades volume for safety: at 3e−3 the maker trades less than half as much, and its spread capture falls further than its inventory losses.
 
 ### Market maker: the harness and a fixed-spread baseline (Project 3, step 2)
 
@@ -738,7 +792,7 @@ flowchart TB
 | 0 · Foundation | Monorepo, CMake + uv, CI with ASan/UBSan, LOBSTER loader | CI green | ✅ done |
 | 1 · Monte Carlo engine | Pricer with error bars ✅ → variance reduction ✅ → Greeks ✅ → Asian/barrier/American (Longstaff–Schwartz) ✅ → Merton + Heston ✅ → SPY calibration ✅ → Numba ✅ | MC within its standard error of Black–Scholes | ✅ done |
 | 2 · Limit order book | Matching engine ✅ → property tests ✅ → LOBSTER replay ✅ → snapshot tests + pinned digests ✅ → benchmarks ✅ → pybind11 module ✅ → microstructure analytics ✅ | Rebuilt book matches LOBSTER on every event ✅ (AAPL: 400,390 events, 0 mismatches) | ✅ done |
-| 3 · Market maker | Synthetic market ✅ → harness, PnL split, markouts ✅ → Avellaneda–Stoikov → OFI skew (walk-forward) → historical replay → FYP risk overlay → head-to-head | Walk-forward, out-of-sample, net of fees | 🔨 in progress |
+| 3 · Market maker | Synthetic market ✅ → harness, PnL split, markouts ✅ → Avellaneda–Stoikov ✅ → OFI skew (walk-forward) → historical replay → FYP risk overlay → head-to-head | Walk-forward, out-of-sample, net of fees | 🔨 in progress |
 | 4 · Add-ons | Delta-hedging PnL simulator, Almgren–Chriss execution on the book | — | ⏳ |
 
 ## Quickstart
@@ -762,6 +816,7 @@ uv run python -m orderbook.gate                            # Phase 2 step 5: Pyt
 uv run python -m orderbook.microstructure                  # Phase 2 step 6: analytics gate + figure (~15 s)
 uv run python -m mm_strategy.experiments.market            # Project 3 step 1: synthetic market gate (~12 s)
 uv run python -m mm_strategy.experiments.harness           # Project 3 step 2: maker harness gate (~45 s)
+uv run python -m mm_strategy.experiments.avellaneda        # Project 3 step 3: A–S γ sweep (~1.5 min; README used --sessions 40)
 ```
 
 C++ core (needs CMake ≥ 3.25 and a C++20 compiler):
@@ -878,8 +933,10 @@ quant-stack/
       golden/         snapshot-test transcripts (step 3.5)
   mm_strategy/        Project 3: synthetic market (hidden GBM fair value, noise and informed
                       traders, event loop into the C++ book), markouts, the market maker
-                      (maker.py: quoting, fills, strategies) and its accounting
-    experiments/      one gate per step (market.py: step 1, harness.py: step 2)
+                      (maker.py: quoting, fills, fixed spread, Avellaneda–Stoikov), its
+                      accounting, and calibration of σ and fill intensity
+    experiments/      one gate per step (market.py: step 1, harness.py: step 2,
+                      avellaneda.py: step 3)
   marketdata/         loaders: LOBSTER, option-chain snapshots → implied-vol surface
   tests/              pytest + Hypothesis property tests
   data/               market data: committed snapshots in data/snapshots/, the rest git-ignored
@@ -909,6 +966,7 @@ quant-stack/
 - Order book: single-threaded, no self-trade prevention, no hidden or iceberg orders. Post-only orders are rejected rather than re-priced when they would cross.
 - LOBSTER replay: validated on one stock-day. More LOBSTER sample days (MSFT, for example) would broaden it. The real-data gate runs locally, not in CI, because the sample can't be redistributed.
 - Order book tests: the reference model and the engine share an author, so a misreading of the matching rules common to both would pass the comparison. The planted bugs show the checks can catch errors; they don't prove the rules match an exchange's. Step 3's replay against real Nasdaq data is that outside check.
+- Avellaneda–Stoikov is calibrated once, on separate sessions, and held fixed. σ is estimated at 60-second sampling, which still sits 2.4 s.e. above the true value. The finite-horizon formulas make the skew strongest at the open, so this session-long horizon is a modelling choice.
 - Market maker: PnL is marked to the closing mid, without the cost of flattening the position. Decisions come on a fixed 100 ms clock, with no reaction to individual book events, and the quote size ignores queue position. Fees are illustrative, not one exchange's schedule.
 - Synthetic market: the noise traders know nothing and the informed traders know everything. There are no momentum traders, no news jumps, and no other market makers yet. The fair value is GBM with constant volatility. The parameters were chosen for a sensible book, not fitted to a real stock.
 - Analytics: the windows count quote updates, not time. Time windows (the last 10 s, say) aren't built yet. The real-data check covers one stock-day and one tick size. The OFI regression pools the whole day. The queue tracker counts the replay's anonymous blocks (orders that rested before the open or outside the visible levels) as single orders.
